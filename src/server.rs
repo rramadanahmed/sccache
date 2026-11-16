@@ -2663,7 +2663,7 @@ mod tests {
         let lock_path = tempdir.path().join("server.sock.lock");
         let runtime = Runtime::new().unwrap();
         let _guard = runtime.enter();
-        let live = tokio::net::UnixListener::bind(&path).unwrap();
+        let _live = tokio::net::UnixListener::bind(&path).unwrap();
 
         let error = match bind_unix_listener(&path) {
             Ok(_) => panic!("a live Unix listener must not be replaced"),
@@ -2675,8 +2675,26 @@ mod tests {
             std::fs::metadata(lock_path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
 
-        drop(live);
+    // A socket that was bound but never listened refuses connections like one
+    // left behind by a dead server. Dropping a real listener isn't enough on
+    // macOS: there is no SOCK_CLOEXEC, so a process spawned concurrently by
+    // another test can inherit the fd and keep the socket accepting.
+    #[cfg(unix)]
+    #[test]
+    fn unix_socket_binding_replaces_stale_socket() {
+        use socket2::{Domain, SockAddr, Socket, Type};
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("server.sock");
+        let runtime = Runtime::new().unwrap();
+        let _guard = runtime.enter();
+
+        let stale = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+        stale.bind(&SockAddr::unix(&path).unwrap()).unwrap();
+        drop(stale);
+
         let replacement = bind_unix_listener(&path).unwrap();
         assert!(std::os::unix::net::UnixStream::connect(&path).is_ok());
         drop(replacement);
