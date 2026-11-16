@@ -50,6 +50,10 @@ We also take into account in the hash:
 
 See https://github.com/mozilla/sccache/blob/8567bbe2ba493153e76177c1f9a6f98cc7ba419f/src/compiler/c.rs#L84
 
+Opt-in [local MSVC `/Z7` PCH caching](MsvcPch.md) instead hashes a real
+syntax/dependency scan's source and consumed files, plus the binary PCH for
+consumers. Its path/context digest is not normalized by `SCCACHE_BASEDIRS`.
+
 ### C/C++ preprocessor
 
 In "preprocessor cache mode", [explained in the local doc](Local.md), an

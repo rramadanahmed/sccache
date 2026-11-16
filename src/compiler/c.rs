@@ -416,6 +416,13 @@ where
     ) -> Result<HashResult<T>> {
         let start_of_compilation = std::time::SystemTime::now();
 
+        if self.compiler.kind() == CCompilerKind::Msvc
+            && super::msvc::uses_pch(&self.parsed_args)
+            && storage.cache_type_name() != "disk"
+        {
+            bail!("MSVC PCH caching requires server-side local disk storage");
+        }
+
         let extra_hashes = hash_all(&self.parsed_args.extra_hash_files, &pool.clone()).await?;
         // The assembler that turns the compiler's output into the object file is
         // as much a part of the result as the compiler itself.

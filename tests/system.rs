@@ -47,6 +47,518 @@ use which::{which, which_in};
 
 mod harness;
 
+#[cfg(target_env = "msvc")]
+mod embedded_pch {
+    use super::*;
+    use object::{Object, ObjectSection};
+
+    struct Probe {
+        dir: tempfile::TempDir,
+        compiler: Compiler,
+        port: u16,
+    }
+
+    impl Probe {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = sccache_client_cfg(dir.path(), true);
+            write_json_cfg(dir.path(), "config.json", &cfg);
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            let probe = Self {
+                dir,
+                compiler: find_compilers().remove(0),
+                port,
+            };
+            probe
+                .command()
+                .arg("--start-server")
+                .status()
+                .unwrap()
+                .success()
+                .then_some(())
+                .expect("start isolated PCH test server");
+            probe
+        }
+
+        fn command(&self) -> Command {
+            let mut cmd = sccache_command();
+            cmd.current_dir(self.dir.path())
+                .envs(self.compiler.env_vars.clone())
+                .env("SCCACHE_SERVER_PORT", self.port.to_string())
+                .env("SCCACHE_CONF", self.dir.path().join("config.json"))
+                .env("SCCACHE_CACHED_CONF", self.dir.path().join("cached-config"))
+                .env("SCCACHE_MSVC_PCH_DETERMINISTIC", "1");
+            cmd
+        }
+
+        fn native(&self) -> Command {
+            let mut cmd = Command::new(&self.compiler.exe);
+            cmd.current_dir(self.dir.path())
+                .envs(self.compiler.env_vars.clone());
+            cmd
+        }
+
+        fn compile(&self, source: &str, object: &str, flags: &[&str]) -> Output {
+            let output = self
+                .command()
+                .arg(&self.compiler.exe)
+                .args(["/nologo", "/c", "/MD", "/Od", "/Z7", "/Fppch.pch"])
+                .arg(format!("/Fo{object}"))
+                .arg(format!("/sourceDependencies{object}.json"))
+                .arg("/showIncludes")
+                .args(flags)
+                .arg(source)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        }
+
+        fn build(&self, define: &str) {
+            self.compile(
+                "creator\\pch.cpp",
+                "pch.obj",
+                &["/Yustdafx.h", "/Ycstdafx.h"],
+            );
+            self.compile("user\\a.cpp", "a.obj", &["/Yustdafx.h", define]);
+            self.compile("user\\b.cpp", "b.obj", &["/Yustdafx.h"]);
+            self.compile("user\\main.cpp", "main.obj", &["/Yustdafx.h"]);
+        }
+
+        fn stats(&self, hits: u64, misses: u64) {
+            let output = self
+                .command()
+                .args(["--show-stats", "--stats-format=json"])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let info: sccache::server::ServerInfo = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(hits, info.stats.cache_hits.all());
+            assert_eq!(misses, info.stats.cache_misses.all());
+            assert_eq!(0, info.stats.cache_errors.all());
+            assert_eq!(0, info.stats.cache_write_errors);
+            eprintln!("embedded PCH: {hits} hits, {misses} misses");
+        }
+
+        fn link(&self, expected: &str, pch_size: u16) {
+            self.native()
+                .args([
+                    "/nologo",
+                    "pch.obj",
+                    "a.obj",
+                    "b.obj",
+                    "main.obj",
+                    "/Feprobe.exe",
+                    "/link",
+                    "/DEBUG:FULL",
+                    "/INCREMENTAL:NO",
+                    "/PDB:linked.pdb",
+                ])
+                .assert()
+                .success();
+            let output = Command::new(self.dir.path().join("probe.exe"))
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(expected, String::from_utf8_lossy(&output.stdout).trim());
+            for (file, section, expected_type) in [
+                ("pch.obj", ".debug$P", Some(("PchType", pch_size))),
+                ("a.obj", ".debug$T", Some(("AType", 4))),
+                ("b.obj", ".debug$T", Some(("BType", 24))),
+                ("main.obj", ".debug$T", None),
+            ] {
+                let bytes = fs::read(self.dir.path().join(file)).unwrap();
+                let obj = object::File::parse(&*bytes).unwrap();
+                assert!(obj.section_by_name(".debug$S").is_some());
+                let types = obj.section_by_name(section).unwrap().data().unwrap();
+                assert_eq!(&types[..4], &[4, 0, 0, 0]);
+                let types = structures(&types[4..]);
+                if let Some((name, size)) = expected_type {
+                    assert_eq!(Some(&size), types.get(name), "{file}");
+                }
+            }
+            let pe = fs::read(self.dir.path().join("probe.exe")).unwrap();
+            let pe = object::File::parse(&*pe).unwrap();
+            let identity = pe.pdb_info().unwrap().unwrap();
+            let pdb = fs::read(self.dir.path().join("linked.pdb")).unwrap();
+            let info = msf_stream(&pdb, 1);
+            assert_eq!(identity.age(), u32_at(&info, 8));
+            assert_eq!(identity.guid().as_slice(), &info[12..28]);
+            assert!(identity.path().ends_with(b"linked.pdb"));
+            let tpi = msf_stream(&pdb, 2);
+            let types = structures(&tpi[u32_at(&tpi, 4) as usize..]);
+            for (name, size) in [("PchType", pch_size), ("AType", 4), ("BType", 24)] {
+                assert_eq!(Some(&size), types.get(name), "linker PDB {name}");
+            }
+        }
+    }
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            let _ = self
+                .command()
+                .arg("--stop-server")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+
+    fn u32_at(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn msf_stream(bytes: &[u8], index: usize) -> Vec<u8> {
+        assert!(bytes.starts_with(b"Microsoft C/C++ MSF 7.00\r\n\x1aDS\0\0\0"));
+        let page_size = u32_at(bytes, 32) as usize;
+        let dir_size = u32_at(bytes, 44) as usize;
+        let block_map = u32_at(bytes, 52) as usize * page_size;
+        let mut directory = Vec::new();
+        for i in 0..dir_size.div_ceil(page_size) {
+            let offset = u32_at(bytes, block_map + i * 4) as usize * page_size;
+            directory.extend_from_slice(&bytes[offset..offset + page_size]);
+        }
+        let count = u32_at(&directory, 0) as usize;
+        assert!(index < count);
+        let mut pages = 4 + count * 4;
+        for i in 0..index {
+            let size = u32_at(&directory, 4 + i * 4);
+            if size != u32::MAX {
+                pages += (size as usize).div_ceil(page_size) * 4;
+            }
+        }
+        let size = u32_at(&directory, 4 + index * 4) as usize;
+        let mut stream = Vec::new();
+        for i in 0..size.div_ceil(page_size) {
+            let offset = u32_at(&directory, pages + i * 4) as usize * page_size;
+            stream.extend_from_slice(&bytes[offset..offset + page_size]);
+        }
+        stream.truncate(size);
+        stream
+    }
+
+    fn structures(mut records: &[u8]) -> HashMap<String, u16> {
+        let mut types = HashMap::new();
+        while !records.is_empty() {
+            let size = u16::from_le_bytes(records[..2].try_into().unwrap()) as usize + 2;
+            let record = &records[..size];
+            let kind = u16::from_le_bytes(record[2..4].try_into().unwrap());
+            assert!(
+                ![0x1501, 0x1515].contains(&kind),
+                "compiler PDB type-server reference"
+            );
+            if kind == 0x1505 && record[6] & 0x80 == 0 {
+                let size = u16::from_le_bytes(record[20..22].try_into().unwrap());
+                assert!(size < 0x8000);
+                let name = record[22..].split(|&b| b == 0).next().unwrap();
+                types.insert(String::from_utf8(name.to_vec()).unwrap(), size);
+            }
+            records = &records[size..];
+        }
+        types
+    }
+
+    #[test]
+    #[serial]
+    fn test_msvc_embedded_pch() {
+        let probe = Probe::new();
+        let dir = probe.dir.path();
+        fs::create_dir(dir.join("creator")).unwrap();
+        fs::create_dir(dir.join("user")).unwrap();
+        let header =
+            |width| format!("#define PCH_VALUE 17\nstruct PchType {{ int values[{width}]; }};\n");
+        write_source(dir, "creator\\stdafx.h", &header(1));
+        write_source(
+            dir,
+            "creator\\pch.cpp",
+            "#include \"stdafx.h\"\nint creator_value() { return sizeof(PchType); }\n",
+        );
+        write_source(
+            dir,
+            "user\\stdafx.h",
+            "#error ignored consumer-local shadow\n#define PCH_VALUE 99\n",
+        );
+        write_source(dir, "user\\after.h", "#define AFTER_VALUE 3\n");
+        write_source(dir, "user\\selected.h", "#define SELECTED 2\n");
+        let a = |extra| {
+            format!(
+                "#include \"stdafx.h\"\n#include \"after.h\"\n\
+             #if PCH_VALUE == 17\n#include \"selected.h\"\n#else\n#error wrong PCH state\n#endif\n\
+             struct AType {{ int value; }};\nint a() {{ AType v = {{1}}; \
+             return sizeof(v) + sizeof(PchType) + AFTER_VALUE + SELECTED + LOCAL_DEFINE + {extra}; }}\n"
+            )
+        };
+        write_source(dir, "user\\a.cpp", &a(0));
+        write_source(
+            dir,
+            "user\\b.cpp",
+            "#include \"stdafx.h\"\nstruct BType { long long values[3]; };\n\
+             int b() { BType v = {}; return sizeof(v) + sizeof(PchType); }\n",
+        );
+        write_source(
+            dir,
+            "user\\main.cpp",
+            "#include \"stdafx.h\"\n#include <stdio.h>\n\
+             int a(); int b(); int creator_value();\n\
+             int main() { printf(\"%d %d %d\\n\", creator_value(), a(), b()); }\n",
+        );
+        probe.build("/DLOCAL_DEFINE=1");
+        probe.stats(0, 4);
+        probe.link("4 14 28", 4);
+        let files = ["pch.pch", "pch.obj", "a.obj", "b.obj", "main.obj"];
+        let genuine: Vec<_> = files
+            .iter()
+            .map(|file| fs::read(dir.join(file)).unwrap())
+            .collect();
+        for fresh in [false, true] {
+            for file in files {
+                if fresh {
+                    fs::remove_file(dir.join(file)).unwrap();
+                } else {
+                    fs::write(dir.join(file), b"unrelated warm output").unwrap();
+                }
+            }
+            probe.build("/DLOCAL_DEFINE=1");
+            for (file, expected) in files.iter().zip(&genuine) {
+                assert_eq!(*expected, fs::read(dir.join(file)).unwrap(), "{file}");
+            }
+            probe.link("4 14 28", 4);
+        }
+        probe.stats(8, 4);
+        write_source(
+            dir,
+            "user\\stdafx.h",
+            "#error changed ignored shadow\n#define PCH_VALUE 1000\n",
+        );
+        fs::remove_file(dir.join("a.obj.json")).unwrap();
+        let output = probe.compile("user\\a.cpp", "a.obj", &["/Yustdafx.h", "/DLOCAL_DEFINE=1"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("after.h") && stdout.contains("selected.h"),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("stdafx.h"), "{stdout}");
+        let deps: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("a.obj.json")).unwrap()).unwrap();
+        let includes = deps["Data"]["Includes"].as_array().unwrap();
+        assert_eq!(2, includes.len());
+        assert!(
+            includes
+                .iter()
+                .all(|v| !v.as_str().unwrap().ends_with("stdafx.h"))
+        );
+        assert!(deps["Data"]["PCH"].as_str().unwrap().ends_with("pch.pch"));
+        let native = probe
+            .native()
+            .args([
+                "/nologo",
+                "/c",
+                "/MD",
+                "/Od",
+                "/Z7",
+                "/Yustdafx.h",
+                "/Fppch.pch",
+                "/Foa-native.obj",
+                "/sourceDependenciesa-native.json",
+                "/showIncludes",
+                "/DLOCAL_DEFINE=1",
+                "user\\a.cpp",
+            ])
+            .output()
+            .unwrap();
+        assert!(native.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&native.stdout)
+                .lines()
+                .collect::<Vec<_>>(),
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .collect::<Vec<_>>()
+        );
+        let native_deps: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("a-native.json")).unwrap()).unwrap();
+        assert_eq!(native_deps, deps);
+        let textual = probe
+            .native()
+            .args([
+                "/nologo",
+                "/E",
+                "/Z7",
+                "/Yustdafx.h",
+                "/Fppch.pch",
+                "/DLOCAL_DEFINE=1",
+                "user\\a.cpp",
+            ])
+            .output()
+            .unwrap();
+        assert!(!textual.status.success(), "/E is not a valid /Yu scan");
+        probe.stats(9, 4);
+        write_source(dir, "user\\a.cpp", &a(1));
+        probe.compile("user\\a.cpp", "a.obj", &["/Yustdafx.h", "/DLOCAL_DEFINE=1"]);
+        probe.stats(9, 5);
+        probe.link("4 15 28", 4);
+        write_source(dir, "user\\after.h", "#define AFTER_VALUE 4\n");
+        probe.compile("user\\a.cpp", "a.obj", &["/Yustdafx.h", "/DLOCAL_DEFINE=1"]);
+        probe.stats(9, 6);
+        probe.link("4 16 28", 4);
+        probe.compile("user\\a.cpp", "a.obj", &["/Yustdafx.h", "/DLOCAL_DEFINE=2"]);
+        probe.stats(9, 7);
+        probe.link("4 17 28", 4);
+        write_source(dir, "creator\\stdafx.h", &header(2));
+        probe.build("/DLOCAL_DEFINE=2");
+        probe.stats(9, 11);
+        probe.link("8 21 32", 8);
+        write_source(dir, "creator\\stdafx.h", &header(3));
+        probe
+            .native()
+            .args([
+                "/nologo",
+                "/c",
+                "/MD",
+                "/Od",
+                "/Z7",
+                "/Ycstdafx.h",
+                "/Yustdafx.h",
+                "/Fppch.pch",
+                "/Fopch.obj",
+                "creator\\pch.cpp",
+            ])
+            .assert()
+            .success();
+        probe.compile("user\\a.cpp", "a.obj", &["/Yustdafx.h", "/DLOCAL_DEFINE=2"]);
+        probe.compile("user\\b.cpp", "b.obj", &["/Yustdafx.h"]);
+        probe.compile("user\\main.cpp", "main.obj", &["/Yustdafx.h"]);
+        probe.stats(9, 14);
+        probe.link("12 25 36", 12);
+        write_source(
+            dir,
+            "creator\\pch.cpp",
+            "#define CREATOR_CONTEXT 1\n#include \"stdafx.h\"\n\
+             int creator_value() { return sizeof(PchType) + CREATOR_CONTEXT; }\n",
+        );
+        probe.build("/DLOCAL_DEFINE=2");
+        probe.stats(9, 18);
+        probe.link("13 25 36", 12);
+        for _ in 0..2 {
+            probe.compile(
+                "creator\\pch.cpp",
+                "pch.obj",
+                &["/Ycstdafx.h", "/Yustdafx.h"],
+            );
+        }
+        probe.stats(10, 19);
+        write_source(dir, "plain.cpp", "int plain() { return 7; }\n");
+        for flags in [
+            vec!["/Y-", "/Ycnot-found.h"],
+            vec!["/Yunot-found.h", "/Y-"],
+            vec![],
+        ] {
+            for _ in 0..2 {
+                probe.compile("plain.cpp", "plain.obj", &flags);
+            }
+        }
+        probe.stats(13, 22);
+        assert!(!dir.join("vc.pdb").exists());
+        assert_eq!(
+            vec!["linked.pdb"],
+            fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .filter(|name| Path::new(name).extension() == Some(OsStr::new("pdb")))
+                .collect::<Vec<_>>()
+        );
+        for mode in ["/Zi", "/ZI"] {
+            for _ in 0..2 {
+                probe
+                    .command()
+                    .arg(&probe.compiler.exe)
+                    .args([
+                        "/nologo",
+                        "/c",
+                        "/Od",
+                        mode,
+                        "/Ycstdafx.h",
+                        "/Fpunsupported.pch",
+                        "/Founsupported.obj",
+                        "creator\\pch.cpp",
+                    ])
+                    .assert()
+                    .success();
+                probe
+                    .command()
+                    .arg(&probe.compiler.exe)
+                    .args([
+                        "/nologo",
+                        "/c",
+                        "/Od",
+                        mode,
+                        "/Yustdafx.h",
+                        "/Fpunsupported.pch",
+                        "/Founsupported-user.obj",
+                        "user\\b.cpp",
+                    ])
+                    .assert()
+                    .success();
+            }
+        }
+        probe.stats(13, 22);
+        write_source(
+            dir,
+            "user\\bad.cpp",
+            "#include \"stdafx.h\"\n#error PCH syntax scan must report this\n",
+        );
+        probe
+            .command()
+            .arg(&probe.compiler.exe)
+            .args([
+                "/nologo",
+                "/c",
+                "/MD",
+                "/Z7",
+                "/Yustdafx.h",
+                "/Fppch.pch",
+                "/Fobad.obj",
+                "user\\bad.cpp",
+            ])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("PCH syntax scan must report this"));
+        write_source(
+            dir,
+            "user\\warning.cpp",
+            "#include \"stdafx.h\"\nint warning() { return 0; }\n",
+        );
+        probe
+            .command()
+            .arg(&probe.compiler.exe)
+            .args([
+                "/nologo",
+                "/c",
+                "/MD",
+                "/Z7",
+                "/W4",
+                "/WX",
+                "/Yustdafx.h",
+                "/Fppch.pch",
+                "/Fowarning.obj",
+                "user\\warning.cpp",
+            ])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("C4652"));
+        eprintln!(
+            "embedded PCH: genuine COFF types, linker PDB/PE identities and 9 program outputs verified"
+        );
+    }
+}
+
 #[derive(Clone)]
 struct Compiler {
     pub name: &'static str,

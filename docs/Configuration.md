@@ -204,6 +204,7 @@ Note that some env variables may need sccache server restart to take effect.
 * `SCCACHE_CACHE_READ_TIMEOUT_SECS` how long, in seconds, a cache lookup may take before sccache gives up on it and compiles locally. Defaults to `60`. A lower value helps when the storage backend is slow or unresponsive rather than failing outright, for example in CI.
 * `SCCACHE_SKIP_CACHE_CHECK` set to `true`, `on`, or `1` to skip remote cache capability checks. The configured backend `rw_mode` is used without reading or writing `.sccache_check`. The user is responsible for ensuring that the cache is reachable and grants the configured access.
 * `SCCACHE_CACHE_MULTIARCH` set (to any value, even `0`) to enable caching of builds with several different `-arch` flags, which are not cached by default. See [the caching doc](Caching.md#cc-compiler).
+* `SCCACHE_MSVC_PCH_DETERMINISTIC` set to exactly `1` to opt into server-side local-disk MSVC `/Z7` PCH caching for deterministic inputs. This promises no volatile macros, including ones hidden in PCH state. See [the PCH contract and limitations](MsvcPch.md); `/Zi` and `/ZI` PCH modes remain uncached.
 * `SCCACHE_CACHE_ZSTD_LEVEL` to set zstd compression level of cache. the range is `1-22` and default is `3`.
   - For example, in `10`, it have about 0.9x size with about 1.6x time than default `3` (tested with compiling sccache code)
   - This option will only applied to newly compressed cache and don't affect existing cache.

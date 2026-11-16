@@ -395,6 +395,12 @@ Known Caveats
 
 [More details on Rust caveats](/docs/Rust.md)
 
+### MSVC precompiled headers
+
+For native MSVC `/Z7` precompiled headers, see the opt-in
+[local PCH caching contract](docs/MsvcPch.md). `/Zi` and `/ZI` PCH builds remain
+uncached.
+
 ### C++20 Modules
 
 sccache has partial support for C++20 named modules when using **Clang**. The following flags are supported:

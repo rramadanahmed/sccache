@@ -19,7 +19,9 @@ use crate::compiler::{
     SingleCompileCommand, clang, gcc, write_temp_file,
 };
 use crate::mock_command::{CommandCreatorSync, RunCommand};
-use crate::util::{OsStrExt, encode_path, env_var_name_matches, run_input_output};
+use crate::util::{
+    Digest, HashToDigest, OsStrExt, encode_path, env_var_name_matches, run_input_output,
+};
 use crate::{counted_array, dist};
 use async_trait::async_trait;
 use fs::File;
@@ -27,6 +29,7 @@ use fs_err as fs;
 use log::Level::Debug;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
+use std::hash::Hash;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
@@ -67,13 +70,22 @@ impl CCompilerImpl for Msvc {
         let Ok(suffix) = cl_env_args(env_vars, "_CL_") else {
             return CompilerArguments::CannotCache("_CL_ environment variable value broken", None);
         };
-        if prefix.is_empty() && suffix.is_empty() {
-            return parse_arguments(arguments, cwd, self.is_clang);
-        }
         let mut combined = prefix;
         combined.extend_from_slice(arguments);
         combined.extend(suffix);
-        parse_arguments(&combined, cwd, self.is_clang)
+        let parsed = parse_arguments(&combined, cwd, self.is_clang);
+        if let CompilerArguments::Ok(args) = &parsed
+            && uses_pch(args)
+            && !env_vars.iter().any(|(key, value)| {
+                env_var_name_matches(key, "SCCACHE_MSVC_PCH_DETERMINISTIC") && value == "1"
+            })
+        {
+            return CompilerArguments::CannotCache(
+                "PCH requires SCCACHE_MSVC_PCH_DETERMINISTIC=1",
+                None,
+            );
+        }
+        parsed
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -319,6 +331,11 @@ ArgData! {
     DepFile(PathBuf),
     ProgramDatabase(PathBuf),
     DebugInfo,
+    EmbeddedDebug,
+    PchFile(PathBuf),
+    PchCreate(PathBuf),
+    PchUse(PathBuf),
+    DisablePch,
     PassThrough, // Miscellaneous flags that don't prevent caching.
     PassThroughWithPath(PathBuf), // As above, recognised by prefix.
     PassThroughWithSuffix(OsString), // As above, recognised by prefix.
@@ -374,7 +391,7 @@ msvc_args!(static ARGS: [ArgInfo<ArgData>; _] = [
     msvc_take_arg!("Fi", PathBuf, Concatenated, TooHardPath),
     msvc_take_arg!("Fm", PathBuf, Concatenated, PassThroughWithPath), // No effect if /c is specified.
     msvc_take_arg!("Fo", PathBuf, Concatenated, Output),
-    msvc_take_arg!("Fp", PathBuf, Concatenated, TooHardPath), // allows users to specify the name for a PCH (when using /Yu or /Yc), PCHs are not supported in sccache.
+    msvc_take_arg!("Fp", PathBuf, Concatenated, PchFile),
     msvc_take_arg!("Fr", PathBuf, Concatenated, TooHardPath),
     msvc_take_arg!("Ft", PathBuf, Concatenated, TooHardPath), // #import include paths - not yet supported.
     msvc_flag!("Fx", TooHardFlag),
@@ -472,12 +489,13 @@ msvc_args!(static ARGS: [ArgInfo<ArgData>; _] = [
     msvc_take_arg!("Wv:", OsString, Concatenated, PassThroughWithSuffix),
     msvc_flag!("X", PassThrough),
     msvc_take_arg!("Xclang", OsString, Separated, XClang),
-    msvc_flag!("Y-", PassThrough), // Disable another PCH options
+    msvc_flag!("Y-", DisablePch),
     msvc_take_arg!("YI", OsString, Concatenated, PassThroughWithSuffix), // Has no effect without /Yc
     msvc_flag!("YI-", PassThrough), // Has no effect without /Yc
-    msvc_take_arg!("Yc", PathBuf, Concatenated, TooHardPath), // Compile PCH - not yet supported.
+    msvc_take_arg!("Yc", PathBuf, Concatenated, PchCreate),
     msvc_flag!("Yd", PassThrough),
-    msvc_flag!("Z7", PassThrough), // Add debug info to .obj files.
+    msvc_take_arg!("Yu", PathBuf, Concatenated, PchUse),
+    msvc_flag!("Z7", EmbeddedDebug),
     msvc_take_arg!("ZH:", OsString, Concatenated, PassThroughWithSuffix),
     msvc_flag!("ZI", DebugInfo), // Implies /FC, which puts absolute paths in error messages -> TooHardFlag?
     msvc_flag!("ZW", PassThrough),
@@ -616,8 +634,6 @@ msvc_args!(static ARGS: [ArgInfo<ArgData>; _] = [
     take_arg!("@", PathBuf, Concatenated, TooHardPath),
 ]);
 
-// TODO: what to do with precompiled header flags? eg: /Yc, /YI, /Yu
-
 /// Options from `CL` are prepended and options from `_CL_` are appended.
 /// The first `#` in each token stands for `=`.
 fn cl_env_args(
@@ -675,6 +691,11 @@ pub fn parse_arguments(
     let mut compilation = false;
     let mut compilation_flag = OsString::new();
     let mut debug_info = false;
+    let mut embedded_debug = false;
+    let mut pch_file = None;
+    let mut pch_create = None;
+    let mut pch_use = None;
+    let mut pch_disabled = false;
     let mut pdb = None;
     let mut depfile = None;
     let mut show_includes = false;
@@ -720,6 +741,11 @@ pub fn parse_arguments(
             Some(DepFile(p)) => depfile = Some(p.clone()),
             Some(ProgramDatabase(p)) => pdb = Some(p.clone()),
             Some(DebugInfo) => debug_info = true,
+            Some(EmbeddedDebug) => embedded_debug = true,
+            Some(PchFile(path)) => pch_file = Some(path.clone()),
+            Some(PchCreate(header)) => pch_create = Some(header.clone()),
+            Some(PchUse(header)) => pch_use = Some(header.clone()),
+            Some(DisablePch) => pch_disabled = true,
             Some(PreprocessorArgument(_))
             | Some(PreprocessorArgumentPath(_))
             | Some(ExtraHashFile(_))
@@ -780,6 +806,11 @@ pub fn parse_arguments(
             | Some(ClangModuleOutput(_))
             | Some(ClangLanguage(_))
             | Some(DebugInfo)
+            | Some(EmbeddedDebug)
+            | Some(PchFile(_))
+            | Some(PchCreate(_))
+            | Some(PchUse(_))
+            | Some(DisablePch)
             | Some(PassThrough)
             | Some(PassThroughWithPath(_))
             | Some(PassThroughWithSuffix(_)) => common_args.extend(
@@ -941,6 +972,46 @@ pub fn parse_arguments(
         None => cannot_cache!("no input file"),
     };
     let mut outputs = HashMap::new();
+    if !pch_disabled && (pch_create.is_some() || pch_use.is_some()) {
+        if is_clang || !embedded_debug || debug_info {
+            cannot_cache!("PCH requires native MSVC /Z7 without /Zi or /ZI");
+        }
+        if let (Some(create), Some(use_header)) = (&pch_create, &pch_use)
+            && create != use_header
+        {
+            cannot_cache!("combined /Yc and /Yu with different boundaries");
+        }
+        if pch_create
+            .as_ref()
+            .or(pch_use.as_ref())
+            .is_some_and(|header| header.as_os_str().is_empty())
+        {
+            cannot_cache!("PCH requires an explicit header boundary");
+        }
+        let Some(path) = pch_file else {
+            cannot_cache!("PCH requires an explicit /Fp");
+        };
+        if path.as_os_str().is_empty()
+            || path.as_os_str().to_string_lossy().ends_with(['\\', '/'])
+            || cwd.join(&path).is_dir()
+        {
+            cannot_cache!("PCH requires an explicit /Fp file");
+        }
+        if depfile.as_ref().is_some_and(|path| {
+            path.as_os_str().to_string_lossy().ends_with(['\\', '/']) || cwd.join(path).is_dir()
+        }) {
+            cannot_cache!("PCH requires a sourceDependencies file, not a directory");
+        }
+        if pch_create.is_some() {
+            outputs.insert(
+                "pch",
+                ArtifactDescriptor {
+                    path: pch_path(path),
+                    optional: false,
+                },
+            );
+        }
+    }
     match output_arg {
         // If output file name is not given, use default naming rule
         None => {
@@ -1089,8 +1160,235 @@ pub fn parse_arguments(
         // FIXME: implement color_mode for msvc.
         color_mode: ColorMode::Auto,
         suppress_rewrite_includes_only: false,
-        too_hard_for_preprocessor_cache_mode: None,
+        too_hard_for_preprocessor_cache_mode: if !pch_disabled
+            && (pch_create.is_some() || pch_use.is_some())
+        {
+            Some("MSVC PCH".into())
+        } else {
+            None
+        },
     })
+}
+
+fn pch_path(path: PathBuf) -> PathBuf {
+    if path.extension().is_none() {
+        path.with_extension("pch")
+    } else {
+        path
+    }
+}
+
+fn option_value(arg: &OsStr, flag: &str) -> Option<OsString> {
+    arg.split_prefix("/")
+        .or_else(|| arg.split_prefix("-"))?
+        .split_prefix(flag)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PchMode {
+    Create,
+    Use,
+}
+
+fn pch_options(args: &ParsedArguments) -> Option<(PchMode, PathBuf)> {
+    if args
+        .common_args
+        .iter()
+        .any(|arg| arg == "/Y-" || arg == "-Y-")
+    {
+        return None;
+    }
+    let mode = if args
+        .common_args
+        .iter()
+        .any(|arg| option_value(arg, "Yc").is_some())
+    {
+        PchMode::Create
+    } else if args
+        .common_args
+        .iter()
+        .any(|arg| option_value(arg, "Yu").is_some())
+    {
+        PchMode::Use
+    } else {
+        return None;
+    };
+    let path = args
+        .common_args
+        .iter()
+        .rev()
+        .find_map(|arg| option_value(arg, "Fp"))?;
+    Some((mode, pch_path(path.into())))
+}
+
+pub(super) fn uses_pch(args: &ParsedArguments) -> bool {
+    pch_options(args).is_some()
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct PchDependencies {
+    version: String,
+    data: PchDependencyData,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
+struct PchDependencyData {
+    source: PathBuf,
+    includes: Vec<PathBuf>,
+    #[serde(rename = "PCH")]
+    pch: Option<PathBuf>,
+    provided_module: String,
+    imported_modules: Vec<serde_json::Value>,
+    imported_header_units: Vec<serde_json::Value>,
+}
+
+fn pch_input_digest(
+    parsed_args: &ParsedArguments,
+    executable: &Path,
+    cwd: &Path,
+    env_vars: &[(OsString, OsString)],
+    dependencies: &PchDependencies,
+) -> Result<String> {
+    if !matches!(dependencies.version.as_str(), "1.1" | "1.2")
+        || !dependencies.data.provided_module.is_empty()
+        || !dependencies.data.imported_modules.is_empty()
+        || !dependencies.data.imported_header_units.is_empty()
+    {
+        bail!("Unsupported MSVC PCH dependency format or modules");
+    }
+    let (mode, path) = pch_options(parsed_args).context("Missing PCH options")?;
+    let source = cwd.join(&parsed_args.input);
+    if fs::canonicalize(&dependencies.data.source)? != fs::canonicalize(&source)? {
+        bail!("MSVC PCH dependency scan returned a different source");
+    }
+    match (mode, &dependencies.data.pch) {
+        (PchMode::Create, None) => {}
+        (PchMode::Use, Some(actual))
+            if fs::canonicalize(actual)? == fs::canonicalize(cwd.join(&path))? => {}
+        _ => bail!("MSVC PCH dependency scan did not use the requested PCH mode"),
+    }
+
+    let mut digest = Digest::new();
+    digest.update(b"msvc-local-z7-pch-v1");
+    (
+        cwd,
+        executable,
+        &parsed_args.input,
+        &parsed_args.compilation_flag,
+        &parsed_args.preprocessor_args,
+        &parsed_args.common_args,
+        &parsed_args.dependency_args,
+        &parsed_args.unhashed_args,
+    )
+        .hash(&mut HashToDigest {
+            digest: &mut digest,
+        });
+    let mut outputs: Vec<_> = parsed_args
+        .outputs
+        .iter()
+        .map(|(name, output)| (name, &output.path))
+        .collect();
+    outputs.sort();
+    outputs.hash(&mut HashToDigest {
+        digest: &mut digest,
+    });
+    let mut env_vars = without_cl_env_vars(env_vars);
+    env_vars.sort();
+    env_vars.hash(&mut HashToDigest {
+        digest: &mut digest,
+    });
+    let mut files = dependencies.data.includes.clone();
+    files.push(source);
+    if mode == PchMode::Use {
+        files.push(cwd.join(path));
+    }
+    files.sort();
+    files.dedup();
+    for path in files {
+        path.hash(&mut HashToDigest {
+            digest: &mut digest,
+        });
+        digest.update(Digest::reader_sync(File::open(&path)?)?.as_bytes());
+    }
+    Ok(digest.finish())
+}
+
+async fn preprocess_pch<T: CommandCreatorSync>(
+    creator: &T,
+    executable: &Path,
+    parsed_args: &ParsedArguments,
+    cwd: &Path,
+    env_vars: &[(OsString, OsString)],
+    includes_prefix: &str,
+) -> Result<process::Output> {
+    let (mode, _) = pch_options(parsed_args).context("Missing PCH options")?;
+    let tempdir = tempfile::Builder::new().prefix("sccache-pch").tempdir()?;
+    let dependencies = tempdir.path().join("dependencies.json");
+    let mut cmd = creator.clone().new_command_sync(executable);
+    cmd.arg("-nologo")
+        .arg("-Zs")
+        .args(&parsed_args.preprocessor_args)
+        .args(&parsed_args.dependency_args);
+    for arg in &parsed_args.common_args {
+        // /Zs /Yc still writes a PCH. Never overwrite the genuine warm output
+        // while deciding whether to restore its matching cached PCH/OBJ pair.
+        if mode == PchMode::Create && option_value(arg, "Fp").is_some() {
+            let mut fp = OsString::from("-Fp");
+            fp.push(tempdir.path().join("scan.pch"));
+            cmd.arg(fp);
+        } else {
+            cmd.arg(arg);
+        }
+    }
+    cmd.args(&parsed_args.unhashed_args)
+        .arg("-sourceDependencies")
+        .arg(&dependencies)
+        .arg(msvc_input_arg(parsed_args, parsed_args.input.as_os_str()))
+        .env_clear()
+        .envs(without_cl_env_vars(env_vars))
+        .current_dir(cwd);
+    let mut output = match run_input_output(cmd, None).await {
+        Ok(output) => output,
+        Err(error) => {
+            return Err(match error.downcast::<ProcessError>() {
+                Ok(ProcessError(mut output)) => {
+                    output.stdout.append(&mut output.stderr);
+                    output.stderr = std::mem::take(&mut output.stdout);
+                    ProcessError(output).into()
+                }
+                Err(error) => error,
+            });
+        }
+    };
+    let json = fs::read(&dependencies).context("Failed to read MSVC PCH dependencies")?;
+    let deps: PchDependencies =
+        serde_json::from_slice(&json).context("Failed to parse MSVC PCH dependencies")?;
+    let args = parsed_args.clone();
+    let exe = executable.to_owned();
+    let dir = cwd.to_owned();
+    let env = env_vars.to_vec();
+    let digest =
+        tokio::task::spawn_blocking(move || pch_input_digest(&args, &exe, &dir, &env, &deps))
+            .await??;
+    if let Some(depfile) = &parsed_args.depfile {
+        fs::write(cwd.join(depfile), json)?;
+    }
+    if parsed_args.msvc_show_includes {
+        output.stderr = output
+            .stdout
+            .split_inclusive(|&b| b == b'\n')
+            .filter(|line| {
+                from_local_codepage(line).is_ok_and(|line| line.starts_with(includes_prefix))
+            })
+            .flatten()
+            .copied()
+            .collect();
+    }
+    // Hash an opaque digest so SCCACHE_BASEDIRS cannot make PCHs portable.
+    output.stdout = digest.into_bytes();
+    Ok(output)
 }
 
 #[cfg(windows)]
@@ -1216,6 +1514,17 @@ pub async fn preprocess<T>(
 where
     T: CommandCreatorSync,
 {
+    if uses_pch(parsed_args) {
+        return preprocess_pch(
+            creator,
+            executable,
+            parsed_args,
+            cwd,
+            env_vars,
+            includes_prefix,
+        )
+        .await;
+    }
     let mut cmd = creator.clone().new_command_sync(executable);
     preprocess_cmd(
         &mut cmd,
@@ -1359,6 +1668,9 @@ fn generate_compile_commands(
     let dist_command = None;
     #[cfg(feature = "dist-client")]
     let dist_command = (|| {
+        if uses_pch(parsed_args) {
+            return None;
+        }
         // http://releases.llvm.org/6.0.0/tools/clang/docs/UsersManual.html#clang-cl
         // TODO: Use /T... for language?
         let mut fo = String::from("-Fo");
@@ -1672,6 +1984,156 @@ mod test {
 
     fn parse_arguments_clang(arguments: Vec<OsString>) -> CompilerArguments<ParsedArguments> {
         super::parse_arguments(&arguments, &std::env::current_dir().unwrap(), true)
+    }
+
+    fn embedded_pch_arguments(
+        arguments: Vec<OsString>,
+        opt_in: bool,
+    ) -> CompilerArguments<ParsedArguments> {
+        let env = if opt_in {
+            vec![("SCCACHE_MSVC_PCH_DETERMINISTIC".into(), "1".into())]
+        } else {
+            vec![]
+        };
+        Msvc {
+            includes_prefix: String::new(),
+            is_clang: false,
+            version: None,
+        }
+        .parse_arguments(&arguments, &std::env::current_dir().unwrap(), &env)
+    }
+
+    #[test]
+    fn test_embedded_pch_creator_and_consumer() {
+        for flag in ["/Ycstdafx.h", "/Yustdafx.h"] {
+            let args = ovec!["/c", "/Z7", "/Fppch.pch", "/Fopch.obj", flag, "pch.cpp"];
+            assert!(matches!(
+                embedded_pch_arguments(args.clone(), false),
+                CompilerArguments::CannotCache(..)
+            ));
+            let CompilerArguments::Ok(parsed) = embedded_pch_arguments(args, true) else {
+                panic!("embedded PCH should be cacheable: {flag}");
+            };
+            assert!(parsed.common_args.contains(&OsString::from(flag)));
+            assert!(parsed.common_args.contains(&OsString::from("/Fppch.pch")));
+            assert!(!parsed.outputs.contains_key("pdb"));
+            if flag.starts_with("/Yc") {
+                assert_eq!(parsed.outputs["pch"].path, Path::new("pch.pch"));
+                assert!(!parsed.outputs["pch"].optional);
+            } else {
+                assert!(!parsed.outputs.contains_key("pch"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_embedded_pch_disabled_and_inactive() {
+        for args in [
+            ovec!["/c", "/Z7", "/Fpinactive.pch", "foo.cpp"],
+            ovec!["/c", "/Y-", "/Ycstdafx.h", "/Fpinactive.pch", "foo.cpp"],
+            ovec!["/c", "/Yustdafx.h", "/Fpinactive.pch", "/Y-", "foo.cpp"],
+        ] {
+            let CompilerArguments::Ok(parsed) = embedded_pch_arguments(args, false) else {
+                panic!("inactive PCH options must not prevent caching");
+            };
+            assert!(!parsed.outputs.contains_key("pch"));
+        }
+    }
+
+    #[test]
+    fn test_embedded_pch_creator_precedence() {
+        for flags in [
+            ovec!["/Yustdafx.h", "/Ycstdafx.h"],
+            ovec!["-Ycstdafx.h", "-Yustdafx.h"],
+        ] {
+            let mut args = ovec!["/c", "/Z7", "/Fppch.pch", "creator.cpp"];
+            args.extend(flags.clone());
+            let CompilerArguments::Ok(parsed) = embedded_pch_arguments(args, true) else {
+                panic!("same-boundary /Yc must take precedence");
+            };
+            assert!(parsed.outputs.contains_key("pch"));
+            assert!(pch_options(&parsed).is_some_and(|(mode, _)| mode == PchMode::Create));
+            for flag in flags {
+                assert!(parsed.common_args.contains(&flag));
+            }
+        }
+    }
+
+    #[test]
+    fn test_embedded_pch_rejects_unsupported_modes() {
+        for flags in [
+            ovec!["/Zi", "/Ycstdafx.h", "/Fppch.pch", "/Fdprivate.pdb"],
+            ovec!["/ZI", "/Yustdafx.h", "/Fppch.pch", "/Fdprivate.pdb"],
+            ovec!["/Zi", "/Z7", "/Yustdafx.h", "/Fppch.pch"],
+            ovec!["/Ycstdafx.h", "/Fppch.pch"],
+            ovec!["/Z7", "/Yustdafx.h"],
+            ovec!["/Z7", "/Yc", "/Fppch.pch"],
+            ovec!["/Z7", "/Yu", "/Fppch.pch"],
+            ovec!["/Z7", "/Ycfirst.h", "/Yusecond.h", "/Fppch.pch"],
+        ] {
+            let mut args = ovec!["/c", "foo.cpp"];
+            args.extend(flags);
+            assert!(
+                matches!(
+                    embedded_pch_arguments(args.clone(), true),
+                    CompilerArguments::CannotCache(..)
+                ),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_embedded_pch_dependency_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        for (path, contents) in [
+            ("a.cpp", "#include \"stdafx.h\"\n#include \"after.h\"\n"),
+            ("after.h", "#define VALUE 1\n"),
+            ("stdafx.h", "#error ignored shadow\n"),
+            ("pch.pch", "binary PCH with original creator context"),
+        ] {
+            fs::write(dir.join(path), contents).unwrap();
+        }
+        let CompilerArguments::Ok(mut args) = embedded_pch_arguments(
+            ovec!["/c", "/Z7", "/Yustdafx.h", "/Fppch.pch", "a.cpp"],
+            true,
+        ) else {
+            panic!("PCH should be cacheable");
+        };
+        let mut deps = PchDependencies {
+            version: "1.2".into(),
+            data: PchDependencyData {
+                source: dir.join("a.cpp"),
+                includes: vec![dir.join("after.h")],
+                pch: Some(dir.join("pch.pch")),
+                provided_module: String::new(),
+                imported_modules: vec![],
+                imported_header_units: vec![],
+            },
+        };
+        let key = |args: &ParsedArguments, deps: &PchDependencies| {
+            pch_input_digest(args, Path::new("cl.exe"), dir, &[], deps).unwrap()
+        };
+        let first = key(&args, &deps);
+        fs::write(dir.join("stdafx.h"), "#error different ignored shadow\n").unwrap();
+        assert_eq!(first, key(&args, &deps));
+        fs::write(dir.join("after.h"), "#define VALUE 2\n").unwrap();
+        assert_ne!(first, key(&args, &deps));
+        let before = key(&args, &deps);
+        fs::write(dir.join("a.cpp"), "#include \"stdafx.h\"\nint changed;\n").unwrap();
+        assert_ne!(before, key(&args, &deps));
+        let before = key(&args, &deps);
+        fs::write(dir.join("pch.pch"), "regenerated binary PCH").unwrap();
+        assert_ne!(before, key(&args, &deps));
+        let before = key(&args, &deps);
+        args.preprocessor_args.push("/DVALUE=3".into());
+        assert_ne!(before, key(&args, &deps));
+        let before = key(&args, &deps);
+        args.outputs.get_mut("obj").unwrap().path = "other.obj".into();
+        assert_ne!(before, key(&args, &deps));
+        deps.data.pch = None;
+        assert!(pch_input_digest(&args, Path::new("cl.exe"), dir, &[], &deps).is_err());
     }
 
     #[test]
@@ -3063,12 +3525,7 @@ mod test {
         );
 
         assert_eq!(
-            CompilerArguments::CannotCache("-Fp", None),
-            parse_arguments(ovec!["-c", "-Fpfoo.h", "foo.c"])
-        );
-
-        assert_eq!(
-            CompilerArguments::CannotCache("-Yc", None),
+            CompilerArguments::CannotCache("PCH requires native MSVC /Z7 without /Zi or /ZI", None),
             parse_arguments(ovec!["-c", "-Ycfoo.h", "foo.c"])
         );
     }
