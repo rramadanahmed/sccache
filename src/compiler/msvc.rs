@@ -15,8 +15,8 @@
 use crate::compiler::args::*;
 use crate::compiler::c::{ArtifactDescriptor, CCompilerImpl, CCompilerKind, ParsedArguments};
 use crate::compiler::{
-    CCompileCommand, Cacheable, ColorMode, CompileCommand, CompilerArguments, Language,
-    SingleCompileCommand, clang, gcc, write_temp_file,
+    CCompileCommand, Cacheable, ColorMode, CompileCommand, CompileCommandImpl, CompilerArguments,
+    Language, SingleCompileCommand, clang, gcc, write_temp_file,
 };
 use crate::mock_command::{CommandCreatorSync, RunCommand};
 use crate::util::{OsStrExt, encode_path, env_var_name_matches, run_input_output};
@@ -138,7 +138,11 @@ impl CCompilerImpl for Msvc {
     {
         generate_compile_commands(path_transformer, executable, parsed_args, cwd, env_vars).map(
             |(command, dist_command, cacheable)| {
-                (CCompileCommand::new(command), dist_command, cacheable)
+                (
+                    CCompileCommand::new(MsvcCompileCommand { inner: command }),
+                    dist_command,
+                    cacheable,
+                )
             },
         )
     }
@@ -1143,62 +1147,184 @@ fn msvc_input_arg(parsed_args: &ParsedArguments, input: &OsStr) -> OsString {
     arg
 }
 
-#[allow(clippy::too_many_arguments)]
-fn preprocess_cmd<T>(
-    cmd: &mut T,
+fn preprocess_arguments(
     parsed_args: &ParsedArguments,
-    cwd: &Path,
-    env_vars: &[(OsString, OsString)],
     may_dist: bool,
     rewrite_includes_only: bool,
     is_clang: bool,
-) where
-    T: RunCommand,
-{
+) -> Vec<OsString> {
     // When performing distributed compilation, line number info is important for error
     // reporting and to not cause spurious compilation failure (e.g. no exceptions build
     // fails due to exceptions transitively included in the stdlib).
     // With -fprofile-generate line number information is important, so use -E.
     // Otherwise, use -EP to maximize cache hits (because no absolute file paths are
     // emitted) and improve performance.
-    if may_dist || parsed_args.profile_generate {
-        cmd.arg("-E");
+    let mode = if may_dist || parsed_args.profile_generate {
+        "-E"
     } else {
-        cmd.arg("-EP");
-    }
-
-    cmd.arg("-nologo")
-        .args(&parsed_args.preprocessor_args)
-        .args(&parsed_args.dependency_args)
-        .args(&parsed_args.common_args)
-        .env_clear()
-        .envs(without_cl_env_vars(env_vars))
-        .current_dir(cwd);
+        "-EP"
+    };
+    let mut arguments = vec![mode.into(), "-nologo".into()];
+    arguments.extend_from_slice(&parsed_args.preprocessor_args);
+    arguments.extend_from_slice(&parsed_args.dependency_args);
+    arguments.extend_from_slice(&parsed_args.common_args);
 
     if is_clang {
         if parsed_args.depfile.is_some() && !parsed_args.msvc_show_includes {
-            cmd.arg("-showIncludes");
+            arguments.push("-showIncludes".into());
         }
     } else {
         // cl.exe can product the dep list itself, in a JSON format that some tools will be expecting.
         if let Some(ref depfile) = parsed_args.depfile {
-            cmd.arg("/sourceDependencies");
-            cmd.arg(depfile);
+            arguments.push("/sourceDependencies".into());
+            arguments.push(depfile.as_os_str().to_owned());
         }
         // Windows SDK generates C4668 during preprocessing, but compiles fine.
         // Read for more info: https://github.com/mozilla/sccache/issues/1725
         // And here: https://github.com/mozilla/sccache/issues/2250
-        cmd.arg("/WX-");
+        arguments.push("/WX-".into());
     }
 
     if rewrite_includes_only && is_clang {
-        cmd.arg("-clang:-frewrite-includes");
+        arguments.push("-clang:-frewrite-includes".into());
     }
 
     if parsed_args.double_dash_input {
-        cmd.arg("--");
+        arguments.push("--".into());
     }
-    cmd.arg(msvc_input_arg(parsed_args, parsed_args.input.as_os_str()));
+    arguments.push(msvc_input_arg(parsed_args, parsed_args.input.as_os_str()));
+    arguments
+}
+
+// CreateProcessW accepts 32,767 UTF-16 units including the terminating NUL.
+#[cfg(windows)]
+const MSVC_COMMAND_LINE_LIMIT: Option<usize> = Some(32_000);
+#[cfg(not(windows))]
+const MSVC_COMMAND_LINE_LIMIT: Option<usize> = None;
+
+fn msvc_command_line_len(executable: &Path, arguments: &[OsString]) -> usize {
+    // An upper bound, allowing for quoting and escaping every backslash and quote.
+    let len = |arg: &OsStr| {
+        let arg = arg.to_string_lossy();
+        arg.encode_utf16().count() + arg.chars().filter(|c| matches!(c, '\\' | '"')).count() + 3
+    };
+    len(executable.as_os_str()) + arguments.iter().map(|arg| len(arg)).sum::<usize>()
+}
+
+fn msvc_response_file_contents(arguments: &[OsString]) -> Result<Vec<u8>> {
+    let mut contents = String::new();
+    for argument in arguments {
+        let argument = argument
+            .to_str()
+            .context("Non-Unicode MSVC response-file argument")?;
+        if argument.contains(['\r', '\n', '\0']) {
+            bail!("MSVC response-file argument contains a line break or NUL");
+        }
+        contents.push('"');
+        let mut backslashes = 0;
+        for character in argument.chars() {
+            if character == '\\' {
+                backslashes += 1;
+                continue;
+            }
+            contents.extend(std::iter::repeat_n(
+                '\\',
+                if character == '"' {
+                    2 * backslashes + 1
+                } else {
+                    backslashes
+                },
+            ));
+            contents.push(character);
+            backslashes = 0;
+        }
+        contents.extend(std::iter::repeat_n('\\', 2 * backslashes));
+        // Separated option/value pairs such as /sourceDependencies must share a line.
+        contents.push_str("\" ");
+    }
+    // Without a BOM cl.exe uses the ANSI code page, which loses Unicode arguments.
+    Ok(std::iter::once(0xfeff_u16)
+        .chain(contents.encode_utf16())
+        .flat_map(u16::to_le_bytes)
+        .collect())
+}
+
+fn msvc_arguments_for_spawn(
+    executable: &Path,
+    arguments: &[OsString],
+    limit: Option<usize>,
+) -> Result<(Vec<OsString>, Option<tempfile::NamedTempFile>)> {
+    let length = msvc_command_line_len(executable, arguments);
+    if !matches!(limit, Some(limit) if length > limit) {
+        return Ok((arguments.to_vec(), None));
+    }
+    let contents = msvc_response_file_contents(arguments)?;
+    let mut response = tempfile::Builder::new()
+        .prefix("sccache-msvc-")
+        .suffix(".rsp")
+        .tempfile()
+        .context("Failed to create an MSVC response file")?;
+    response
+        .write_all(&contents)
+        .and_then(|()| response.flush())
+        .context("Failed to write an MSVC response file")?;
+    let mut argument = OsString::from("@");
+    argument.push(response.path());
+    let arguments = vec![argument];
+    if matches!(limit, Some(limit) if msvc_command_line_len(executable, &arguments) > limit) {
+        bail!("MSVC response-file command itself exceeds the process limit");
+    }
+    debug!(
+        "MSVC command of up to {length} UTF-16 units uses {}",
+        response.path().display()
+    );
+    Ok((arguments, Some(response)))
+}
+
+#[derive(Debug)]
+struct MsvcCompileCommand {
+    inner: SingleCompileCommand,
+}
+
+#[async_trait]
+impl CompileCommandImpl for MsvcCompileCommand {
+    fn get_executable(&self) -> PathBuf {
+        self.inner.get_executable()
+    }
+    fn get_arguments(&self) -> Vec<OsString> {
+        self.inner.get_arguments()
+    }
+    fn get_env_vars(&self) -> Vec<(OsString, OsString)> {
+        self.inner.get_env_vars()
+    }
+    fn get_cwd(&self) -> PathBuf {
+        self.inner.get_cwd()
+    }
+
+    async fn execute<T>(
+        &self,
+        service: &crate::server::SccacheService<T>,
+        creator: &T,
+    ) -> Result<process::Output>
+    where
+        T: CommandCreatorSync,
+    {
+        let (arguments, response_file) = msvc_arguments_for_spawn(
+            &self.inner.executable,
+            &self.inner.arguments,
+            MSVC_COMMAND_LINE_LIMIT,
+        )?;
+        let command = SingleCompileCommand {
+            executable: self.inner.executable.clone(),
+            arguments,
+            env_vars: self.inner.env_vars.clone(),
+            cwd: self.inner.cwd.clone(),
+            share_jobserver: self.inner.share_jobserver,
+        };
+        let output = command.execute(service, creator).await;
+        drop(response_file);
+        output
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1216,16 +1342,14 @@ pub async fn preprocess<T>(
 where
     T: CommandCreatorSync,
 {
+    let arguments = preprocess_arguments(parsed_args, may_dist, rewrite_includes_only, is_clang);
+    let (arguments, response_file) =
+        msvc_arguments_for_spawn(executable, &arguments, MSVC_COMMAND_LINE_LIMIT)?;
     let mut cmd = creator.clone().new_command_sync(executable);
-    preprocess_cmd(
-        &mut cmd,
-        parsed_args,
-        cwd,
-        env_vars,
-        may_dist,
-        rewrite_includes_only,
-        is_clang,
-    );
+    cmd.args(&arguments)
+        .env_clear()
+        .envs(without_cl_env_vars(env_vars))
+        .current_dir(cwd);
 
     if log_enabled!(Debug) {
         debug!("preprocess: {:?}", cmd);
@@ -1235,7 +1359,9 @@ where
     let includes_prefix = includes_prefix.to_string();
     let cwd = cwd.to_owned();
 
-    let output = run_input_output(cmd, None).await?;
+    let output = run_input_output(cmd, None).await;
+    drop(response_file);
+    let output = output?;
 
     if !is_clang {
         return Ok(output);
@@ -1786,6 +1912,73 @@ mod test {
                 }
             )
         );
+    }
+
+    #[test]
+    fn test_generated_response_file_quoting() {
+        let arguments = ovec![
+            "",
+            "/I",
+            "include space \u{65e5}\u{1f680}\\",
+            "/sourceDependencies",
+            "deps space.json",
+            "/DVALUE=L\"quote \\\" and slash\\\\\"",
+            "tab\tspace",
+            "trailing\\\\"
+        ];
+        let contents = msvc_response_file_contents(&arguments).unwrap();
+        assert!(contents.starts_with(&[0xff, 0xfe]));
+        let text = read_text(&mut contents.as_slice()).unwrap();
+        assert!(!text.contains(['\r', '\n']));
+        assert_eq!(
+            SplitMsvcResponseFileArgs::from(&text)
+                .map(OsString::from)
+                .collect::<Vec<_>>(),
+            arguments
+        );
+        for argument in [
+            OsString::from("line\nbreak"),
+            OsString::from("line\rbreak"),
+            OsString::from("nul\0byte"),
+            non_utf8_os_string(),
+        ] {
+            assert!(msvc_response_file_contents(&[argument]).is_err());
+        }
+    }
+
+    #[test]
+    fn test_generated_response_file_threshold_and_lifetime() {
+        let executable = Path::new("cl.exe");
+        let arguments = ovec!["/c", "foo.cpp", "/Fofoo.obj"];
+        let length = msvc_command_line_len(executable, &arguments);
+        for limit in [None, Some(length)] {
+            let (spawn, response) =
+                msvc_arguments_for_spawn(executable, &arguments, limit).unwrap();
+            assert_eq!(spawn, arguments);
+            assert!(response.is_none());
+        }
+        let long = ovec![
+            "/c",
+            "foo.cpp",
+            format!("/DVALUE={}", "\u{1f680}".repeat(17_000))
+        ];
+        assert!(msvc_command_line_len(executable, &long) > 32_767);
+        let (spawn, response) = msvc_arguments_for_spawn(executable, &long, Some(32_000)).unwrap();
+        let response = response.unwrap();
+        assert_eq!(spawn.len(), 1);
+        assert_eq!(
+            PathBuf::from(spawn[0].split_prefix("@").unwrap()),
+            response.path()
+        );
+        assert!(msvc_command_line_len(executable, &spawn) < 32_000);
+        assert_eq!(
+            ExpandIncludeFile::new(Path::new(""), &spawn).collect::<Vec<_>>(),
+            long
+        );
+        let path = response.path().to_owned();
+        assert!(path.exists());
+        drop(response);
+        assert!(!path.exists());
     }
 
     #[test]
@@ -3557,13 +3750,84 @@ mod test {
             CompilerArguments::Ok(args) => args,
             o => panic!("Got unexpected parse result: {:?}", o),
         };
-        let mut cmd = MockCommand {
-            child: None,
-            args: vec![],
-        };
-        preprocess_cmd(&mut cmd, &parsed_args, Path::new(""), &[], true, true, true);
+        let arguments = preprocess_arguments(&parsed_args, true, true, true);
         let expected_args = ovec!["-E", "-nologo", "-clang:-frewrite-includes", "--", "foo.c"];
-        assert_eq!(cmd.args, expected_args);
+        assert_eq!(arguments, expected_args);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_long_preprocess_and_compile_response_files() {
+        let fixture = TestFixture::new();
+        let creator = new_creator();
+        let mut args = ovec!["/c", "foo.cpp", "/Fofoo.obj", "/Z7"];
+        args.extend((0..900).map(|i| OsString::from(format!("/DUNUSED_{i}={}", "x".repeat(64)))));
+        let parsed_args = match parse_arguments(args) {
+            CompilerArguments::Ok(args) => args,
+            other => panic!("Unexpected parse result: {other:?}"),
+        };
+        let compiler = Msvc {
+            includes_prefix: String::new(),
+            is_clang: false,
+            version: None,
+        };
+        let mut transformer = dist::PathTransformer::new();
+        let (command, _, _) = compiler
+            .generate_compile_commands::<std::sync::Arc<std::sync::Mutex<MockCommandCreator>>>(
+                &mut transformer,
+                &fixture.bins[0],
+                &parsed_args,
+                fixture.tempdir.path(),
+                &[],
+                false,
+            )
+            .unwrap();
+        let effective = command.get_arguments();
+        assert!(effective.iter().map(|arg| arg.len()).sum::<usize>() > 55_000);
+        let paths = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        for preprocess in [true, false] {
+            let paths = paths.clone();
+            let expected = effective.clone();
+            next_command_calls(&creator, move |args| {
+                assert_eq!(args.len(), 1, "Backend must spawn through @file");
+                let path = PathBuf::from(args[0].split_prefix("@").expect("@file"));
+                let contents = read_text(&mut File::open(&path).unwrap()).unwrap();
+                let expanded = SplitMsvcResponseFileArgs::from(&contents)
+                    .map(OsString::from)
+                    .collect::<Vec<_>>();
+                if preprocess {
+                    assert_eq!(expanded[0], "-EP");
+                    assert!(expanded.iter().any(|arg| arg == "/WX-"));
+                    assert!(expanded.iter().any(|arg| arg.starts_with("/DUNUSED_899=")));
+                } else {
+                    assert_eq!(expanded, expected);
+                }
+                paths.lock().unwrap().push(path);
+                Ok(MockChild::new(exit_status(0), "", ""))
+            });
+        }
+        let runtime = single_threaded_runtime();
+        let storage = std::sync::Arc::new(MockStorage::new(None, false));
+        let service = server::SccacheService::mock_with_storage(storage, runtime.handle().clone());
+        preprocess(
+            &creator,
+            &fixture.bins[0],
+            &parsed_args,
+            fixture.tempdir.path(),
+            &[],
+            false,
+            "",
+            false,
+            false,
+        )
+        .wait()
+        .unwrap();
+        command.execute(&service, &creator).wait().unwrap();
+        assert_eq!(command.get_arguments(), effective);
+        assert_eq!(creator.lock().unwrap().children.len(), 0);
+        let paths = paths.lock().unwrap();
+        assert_eq!(paths.len(), 2);
+        assert!(paths.iter().all(|path| !path.exists()));
     }
 
     #[test]
@@ -3659,21 +3923,9 @@ mod test {
                 CompilerArguments::Ok(args) => args,
                 o => panic!("Got unexpected parse result: {:?}", o),
             };
-            let mut cmd = MockCommand {
-                child: None,
-                args: vec![],
-            };
-            preprocess_cmd(
-                &mut cmd,
-                &parsed_args,
-                Path::new(""),
-                &[],
-                false,
-                false,
-                false,
-            );
+            let arguments = preprocess_arguments(&parsed_args, false, false, false);
             let expected_args = ovec!["-EP", "-nologo", "/WX-", expected_input];
-            assert_eq!(cmd.args, expected_args);
+            assert_eq!(arguments, expected_args);
         }
     }
 

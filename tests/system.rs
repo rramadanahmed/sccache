@@ -461,6 +461,177 @@ fn test_msvc_responsefile(compiler: Compiler, tempdir: &Path) {
     fs::remove_file(&out_file).unwrap();
 }
 
+#[test_case(false ; "server side")]
+#[test_case(true ; "client side")]
+#[serial]
+#[cfg(target_env = "msvc")]
+fn test_msvc_long_response_file(client_side: bool) {
+    use object::{Object, ObjectSection};
+
+    let tempdir = tempfile::Builder::new()
+        .prefix("sccache_long_rsp")
+        .tempdir()
+        .unwrap();
+    let root = tempdir.path();
+    let compiler = find_compilers().remove(0);
+    let mut config = sccache_client_cfg(root, false);
+    config.client_side_mode = client_side;
+    write_json_cfg(root, "sccache-cfg.json", &config);
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    drop(listener);
+    let sccache = || {
+        let mut cmd = sccache_command();
+        cmd.env("SCCACHE_SERVER_PORT", &port)
+            .env("SCCACHE_CONF", root.join("sccache-cfg.json"))
+            .env("SCCACHE_CACHED_CONF", root.join("cached-cfg"))
+            .envs(compiler.env_vars.clone())
+            .current_dir(root);
+        cmd
+    };
+    assert!(sccache().arg("--start-server").status().unwrap().success());
+    struct StopServer(Command);
+    impl Drop for StopServer {
+        fn drop(&mut self) {
+            assert!(self.0.status().unwrap().success());
+        }
+    }
+    let mut stop = sccache();
+    stop.arg("--stop-server")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let _server = StopServer(stop);
+
+    let include = "include space \u{65e5}\u{1f680}";
+    fs::create_dir(root.join(include)).unwrap();
+    write_source(
+        &root.join(include),
+        "forced header.h",
+        "const int header_value = 42;\n",
+    );
+    write_source(
+        root,
+        "source space.cpp",
+        r#"#ifdef FAIL_PREPROCESS
+#error expected preprocessing failure
+#endif
+#ifdef FAIL_COMPILE
+int broken = undefined_identifier;
+#endif
+int main() {
+    const wchar_t expected[] = L"space \u65e5\U0001f680 quote \" slash\\ end\\";
+    const wchar_t actual[] = TEXT_VALUE;
+    if (sizeof(expected) != sizeof(actual) || header_value != 42) return 1;
+    for (unsigned i = 0; i < sizeof(expected) / sizeof(*expected); ++i)
+        if (expected[i] != actual[i]) return 2;
+    return VALUE;
+}
+"#,
+    );
+    let mut contents = format!(
+        r#"/nologo /c /Z7 /Od /utf-8 /I "{include}\\" /FI "forced header.h" /sourceDependencies "deps space.json" /Fo"object space.obj" "source space.cpp" /D"TEXT_VALUE=L\"space {}{} quote \\\" slash\\ end\\\\\"" "#,
+        '\u{65e5}', '\u{1f680}',
+    );
+    for i in 0..900 {
+        contents.push_str(&format!("/DUNUSED_{i}={} ", "x".repeat(64)));
+    }
+    let length = contents.encode_utf16().count();
+    assert!(length > 55_000);
+    println!("MSVC response payload: {length} UTF-16 units (client_side={client_side})");
+    let write_response = |name: &str, value: u8, extra: &str| {
+        let text = format!("{contents}/DVALUE={value} {extra}");
+        let bytes = std::iter::once(0xfeff_u16)
+            .chain(text.encode_utf16())
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        fs::write(root.join(name), bytes).unwrap();
+    };
+    let compile = |name: &str| {
+        sccache()
+            .arg(&compiler.exe)
+            .arg(format!("@{name}"))
+            .assert()
+            .success();
+    };
+    let stats = || {
+        let result = sccache()
+            .args(["--show-stats", "--stats-format=json"])
+            .output()
+            .unwrap();
+        assert!(result.status.success());
+        serde_json::from_slice::<sccache::server::ServerInfo>(&result.stdout)
+            .unwrap()
+            .stats
+    };
+    let object = root.join("object space.obj");
+    let link_and_run = |value| {
+        Command::new(&compiler.exe)
+            .args(["/nologo", "object space.obj", "/Feresult.exe"])
+            .args(["/link", "/DEBUG", "/INCREMENTAL:NO", "/PDB:result.pdb"])
+            .envs(compiler.env_vars.clone())
+            .current_dir(root)
+            .assert()
+            .success();
+        assert!(fs::metadata(root.join("result.pdb")).unwrap().len() > 0);
+        Command::new(root.join("result.exe")).assert().code(value);
+        fs::remove_file(root.join("result.exe")).unwrap();
+        fs::remove_file(root.join("result.pdb")).unwrap();
+    };
+
+    write_response("original.rsp", 17, "");
+    compile("original.rsp");
+    let cold_object = fs::read(&object).unwrap();
+    let parsed = object::File::parse(&*cold_object).unwrap();
+    assert!(parsed.section_by_name(".debug$S").unwrap().size() > 0);
+    assert_eq!(stats().cache_misses.all(), 1);
+    assert_eq!(stats().cache_hits.all(), 0);
+    link_and_run(17);
+
+    compile("original.rsp");
+    assert_eq!(stats().cache_hits.all(), 1);
+    fs::remove_file(&object).unwrap();
+    fs::remove_file(root.join("deps space.json")).unwrap();
+    fs::rename(root.join("original.rsp"), root.join("renamed space.rsp")).unwrap();
+    compile("renamed space.rsp");
+    assert_eq!(stats().cache_misses.all(), 1);
+    assert_eq!(stats().cache_hits.all(), 2);
+    assert_eq!(fs::read(&object).unwrap(), cold_object);
+    let deps: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("deps space.json")).unwrap()).unwrap();
+    assert!(
+        deps["Data"]["Includes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path.as_str().unwrap().ends_with("forced header.h"))
+    );
+    link_and_run(17);
+
+    write_response("renamed space.rsp", 18, "");
+    compile("renamed space.rsp");
+    assert_eq!(stats().cache_misses.all(), 2);
+    assert_eq!(stats().cache_hits.all(), 2);
+    link_and_run(18);
+
+    fs::remove_file(&object).unwrap();
+    for (flag, diagnostic) in [("FAIL_PREPROCESS", "C1189"), ("FAIL_COMPILE", "C2065")] {
+        write_response("failure.rsp", 18, &format!("/D{flag}"));
+        let result = sccache()
+            .arg(&compiler.exe)
+            .arg("@failure.rsp")
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        let output = [result.stdout, result.stderr].concat();
+        assert!(
+            String::from_utf8_lossy(&output).contains(diagnostic),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        assert!(!object.exists());
+    }
+}
+
 fn test_msvc_show_includes_cache_hit(compiler: Compiler, tempdir: &Path) {
     let Compiler {
         name,
