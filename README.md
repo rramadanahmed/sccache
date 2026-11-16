@@ -166,6 +166,169 @@ cargo build
 
 sccache supports gcc, clang, MSVC, rustc, [NVCC](https://docs.nvidia.com/cuda/cuda-compiler-driver-nvcc/index.html), [NVC++](https://docs.nvidia.com/hpc-sdk//compilers/hpc-compilers-user-guide/index.html), [hipcc](https://rocm.docs.amd.com/projects/HIP/en/latest/index.html), and [Wind River's diab compiler](https://www.windriver.com/products/development-tools/#diab_compiler). Both gcc and msvc support Response Files, read more about their implementation [here](docs/ResponseFiles.md).
 
+With MSVC `/Zi` or `/ZI`, ordinary caching requires an explicit, non-directory
+`/Fd` whose PDB does not already exist. An existing PDB may contain types from
+other translation units, so sccache bypasses preprocessing and cache lookup in
+that case. Use a unique compiler PDB per non-PCH translation unit; rebuilds can
+remove that unit's owned object/PDB pair before invoking sccache. Never remove a
+shared compiler PDB to obtain a cache hit.
+
+Ordinary non-PCH `/Zi` actions and independently owned `/Yc` creators can opt into warm-existing hits with
+`SCCACHE_MSVC_PRIVATE_PDB=1`. Every `/Fd` must be independently owned and match
+its `/Fo` with the extension replaced by `.pdb` or with `.pdb` appended.
+Shared or directory `/Fd` paths are rejected before cache lookup, even with
+this opt-in. Hits restore only the owning object/PDB pair. Misses remove only
+that private PDB before cl generates a fresh genuine database, avoiding
+unhashed incremental state from an earlier source generation. It does not
+enable unseeded `/Yu`; seeded `/Yu` continues to use its genuine seed rather
+than the private-PDB reset.
+
+Local MSVC `/Yc` creators with an explicit `/Fp` can cache the PCH, object, and
+compiler PDB together. Preprocessing hashes the full textual input with PCH
+generation disabled, while actual compilation retains `/Yc`. Ordinary `/Yu`
+consumers sharing the creator's PDB are not cached. Rebuild those consumers
+after restoring a creator's artifacts. An inactive `/Fp` alone does not prevent
+caching, including when `/Y-` disables PCH operations. As in cl, `/Yc` takes
+precedence over `/Yu` regardless of option order.
+Serialize operations that share a PCH compiler PDB; a missing PDB alone is not
+proof that concurrently starting compilations have independent outputs.
+
+For warm-existing `/Yc` hits, `SCCACHE_MSVC_PRIVATE_PDB=1` requires the same
+per-object `/Fd` ownership plus an explicit `/Fp` output distinct from its
+object, compiler PDB and any configured seed snapshot. Hits restore the full
+PCH/OBJ/PDB triple; misses reset only the owned creator PDB. The creator must
+not write a seed currently consumed by other compilations. After successful
+creator completion, publish a genuine copy to a distinct immutable snapshot
+path, with no consumers running during publication. Consumers must depend on
+both PCH and snapshot and all rerun after either changes; changed bytes
+invalidate their cache keys even when old private consumer outputs remain.
+Neither misses nor hits publish or change the snapshot inside sccache.
+
+For local `/Yu` caching with genuine compiler PDBs, opt in using
+`SCCACHE_MSVC_PCH_PDB=<immutable-creator-PDB-path>` and
+`SCCACHE_MSVC_PCH_SOURCE_DEPENDENCIES=1`:
+
+* The creator must finish producing the matching `/Fp` PCH and real `/Fd` PDB
+  before any consumers run. Keep that PDB immutable throughout the consumer
+  generation; it may be read-only. No consumer may write the seed path.
+* Give each consumer a unique `/Fo` and `/Fd`: the PDB path must be the object
+  path with its extension replaced by `.pdb`, or the object path plus `.pdb`.
+  For example `/Foobj/a.obj /Fdobj/a.obj.pdb`. No output aliases or shared PDBs.
+* Each miss atomically copies the genuine seed into the consumer's writable
+  private PDB, then runs the original `/Yu /Zi /Fd` compilation. Hits restore
+  only that consumer's object/PDB pair, even if its previous outputs exist.
+  GUIDs are copied faithfully, never fabricated or rewritten.
+* Every lookup runs a real `/Zs /Yu /Fp /sourceDependencies` syntax-only scan,
+  using a separate private PDB genuinely seeded from the immutable snapshot.
+  Cache keys hash the binary PCH, seed, original raw source and full bytes of
+  actually consumed post-PCH headers, plus compilation and preprocessor flags.
+  No object is emitted by the scan. Hits skip code generation, not this scan.
+* `/E` and `/EP` ignore MSVC PCH state even without `/Y-`. They can expand a
+  different same-named header beside a consumer source. Consumers therefore
+  never use those switches or `/Y-`; only creators use textual preprocessing.
+  Shadow headers ignored by actual `/Yu` are not scan inputs or cache inputs.
+* The source-dependency opt-in declares deterministic consumer inputs: no
+  volatile macro expansions such as `__TIME__`, `__DATE__` or `__TIMESTAMP__`
+  hidden in PCH macro aliases or token-pasting. Raw dependency hashes cannot
+  observe those values. Directly observed time macros conservatively prevent
+  key reuse, but this is not a general PCH macro-state volatility detector.
+  Without the explicit opt-in, consumers remain non-cacheable.
+* The scan validates MSVC source-dependency JSON version 1.2 and the actual
+  source/PCH paths, rejects module dependencies, and disables generic textual
+  preprocessor manifests for consumers. Requested `/showIncludes` and
+  `/sourceDependencies` outputs reflect the real post-PCH dependency set.
+* MSVC discovery uses one `/WX-` after removing overridden `/WX`/`/WX-`
+  switches from the scan-only vector, avoiding D9025 on failing scans.
+  Actual compilation retains the original warning-as-error switches and
+  per-warning policies. This also applies to ordinary/creator preprocessing;
+  clang-cl behavior is unchanged.
+* Build dependencies must include both the PCH and seed PDB. When either is
+  regenerated, rerun every dependent consumer; changed input contents cause
+  misses and private-PDB reseeding. Other consumers' private outputs are never
+  overwritten. Do not merge compiler PDBs.
+
+This strategy was execution-tested with MSVC 14.42, including private PDBs that
+share their genuine creator GUID but assign different records to the same type
+indices. The real linker correctly merged their distinct types by type server.
+Distributed PCH compilation and cross-machine PCH portability are not enabled.
+Other unsupported compiler options retain their normal non-cacheable behavior;
+if bypassing sccache for a private-PDB consumer, seed its PDB before running cl.
+
+In particular, a non-cacheable argument is not a cache miss:
+`server::check_compiler` returns `UnhandledCompile`, and
+`commands::handle_compile_result` runs the original compiler command on the
+client without entering the MSVC miss-time seeding path. A server disconnect
+before `CompileFinished` can take the same local fallback. A zero exit status
+does not expose whether this occurred.
+
+A wrapper that must support such fallback should validate effective `/Yu`,
+`/Fo` and private `/Fd` after response-file and `CL`/`_CL_` expansion, then
+atomically seed that owned PDB **before every sccache invocation**. Invalidate
+only its owned object before seeding; do not touch creator/shared outputs.
+Hits subsequently restore the matching private pair; misses may harmlessly
+reseed it; non-cacheable actions execute the original compiler with a genuine
+seed already present. Return sccache's exact exit status and never run a second
+compiler based on a post-hoc statistics check. Alternatively, an upstream
+ownership-only seeding hook belongs immediately before the client fallback
+spawn, not in cache eligibility parsing. Unsupported flags must remain
+non-cacheable, and ambiguous/shared output ownership must fail closed.
+For a lost `CompileFinished` after `CompileStarted`, do not assume the server
+compiler has stopped: a PDB-sensitive client should fail closed unless prior
+job termination is established, rather than launch a simultaneous retry.
+Wrapper preseeding alone does not fix that separate client-retry race.
+
+On Windows, MSVC preprocessing and actual local compilation use an owned
+UTF-16LE response file when the expanded command would exceed a conservative
+32,000-unit process limit. Quoting preserves spaces, quotes, trailing
+backslashes and non-BMP characters. Each file lives through the complete child
+execution and is then removed. Cache parsing/hashing and command introspection
+still use expanded arguments, not generated response-file names.
+
+A launcher with a 55,000-unit argument list must itself call
+`sccache cl.exe @owned.rsp`, not expand that list into CreateProcess arguments
+or bypass sccache based only on length. Preserve the original response file,
+or write a correctly quoted owned UTF-16LE file, and keep it until the entire
+sccache invocation (including possible client-side fallback) finishes.
+`Invoke-Long-Rsp-Probe.ps1` proves >55,000 expanded UTF16 units with genuine
+PCH/seed/private PDBs, warm/fresh hits, renamed input response files and
+changed-content cache misses.
+
+`tests/msvc-pdb-probe/CMakeLists.txt` is an executable public integration example:
+it registers PCH/OBJ/private-PDB creator outputs, a post-success snapshot-copy
+rule and consumer `OBJECT_DEPENDS`, appends
+`/Fd<OBJECT>.pdb` to `CMAKE_CXX_COMPILE_OBJECT`, and supplies the target-specific
+seed using a `cmake -E env` compiler launcher. Apply equivalent dependency and
+path ownership rules when using CMake's generated PCH rules.
+
+The public Windows probes in `tests/msvc-pdb-probe` are `Invoke-Probe.ps1`
+(ordinary/shared-PDB safety), `Invoke-Seeded-Probe.ps1` (seeded `/Yu`, source/PCH/
+seed invalidation and divergent type merging), and `Invoke-119-Users-Probe.ps1`
+(119 actual `/Yu` consumers). From an MSVC developer environment, pass
+`-Sccache`, a private `-CacheDirectory`, an unused `-Port`, and a fresh
+`-OutputDirectory`; `-Direct` enables direct/preprocessor mode. They compile
+serially with `/MDd /Od /Zi`, validate compiler MSF7/COFF and linker MSF7/PE
+identities, and execute the linked probes. Seeded probes also use MSVC's
+`pdbdump.exe` to validate merged type layouts.
+`Invoke-Private-Pdb-Probe.ps1` covers ordinary opt-in warm hits and independent
+source changes; `Invoke-Fallback-Probe.ps1` proves `/FA` remains non-cacheable
+and its original-compiler `/Yu` fallback needs genuine wrapper preseeding.
+`Invoke-Warning-Policy-Probe.ps1` verifies zero D9025 on successful and failing
+discovery in all three MSVC contexts, while actual `/WX` still rejects a
+genuine C4101 warning. Shadow and long-response probes additionally accept
+`-WarningsAsErrors` to run their complete fidelity gates with original `/WX`.
+`Invoke-Creator-Snapshot-Probe.ps1` verifies warm-existing and removed-output
+creator triple restoration, immutable snapshot publication, and invalidation
+of all consumers after creator changes.
+`Invoke-CMake-Snapshot-Probe.ps1` exercises the same lifecycle through actual
+CMake/Ninja producer, snapshot and consumer dependencies, forced response
+files and a final no-op. It additionally requires `-CMake`, `-Ninja` and
+`-Compiler` paths.
+`Invoke-Shadow-Pch-Probe.ps1` uses a real creator's `stdafx.h` and a different
+consumer-local `stdafx.h` with `#error` and contrary macros. It checks cold/
+warm/fresh hits, ignored shadow changes, actual source/header changes and
+creator regeneration, including real compiler/linker debug identities and
+runtime macro-selected values.
+
 If you don't [specify otherwise](#storage-options), sccache will use a local disk cache.
 
 sccache works using a client-server model, where the server runs locally on the same machine as the client. The client-server model allows the server to be more efficient by keeping some state in memory. The sccache command will spawn a server process if one is not already running, or you can run `sccache --start-server` to start the background server process without performing any compilation.

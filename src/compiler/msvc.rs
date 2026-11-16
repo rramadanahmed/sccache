@@ -15,16 +15,17 @@
 use crate::compiler::args::*;
 use crate::compiler::c::{ArtifactDescriptor, CCompilerImpl, CCompilerKind, ParsedArguments};
 use crate::compiler::{
-    CCompileCommand, Cacheable, ColorMode, CompileCommand, CompilerArguments, Language,
-    SingleCompileCommand, clang, gcc, write_temp_file,
+    CCompileCommand, Cacheable, ColorMode, CompileCommand, CompileCommandImpl, CompilerArguments,
+    Language, SingleCompileCommand, clang, gcc, write_temp_file,
 };
 use crate::mock_command::{CommandCreatorSync, RunCommand};
-use crate::util::{OsStrExt, encode_path, env_var_name_matches, run_input_output};
+use crate::util::{Digest, OsStrExt, encode_path, env_var_name_matches, run_input_output};
 use crate::{counted_array, dist};
 use async_trait::async_trait;
 use fs::File;
 use fs_err as fs;
 use log::Level::Debug;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::io::{self, BufWriter, Read, Write};
@@ -67,13 +68,36 @@ impl CCompilerImpl for Msvc {
         let Ok(suffix) = cl_env_args(env_vars, "_CL_") else {
             return CompilerArguments::CannotCache("_CL_ environment variable value broken", None);
         };
-        if prefix.is_empty() && suffix.is_empty() {
-            return parse_arguments(arguments, cwd, self.is_clang);
+        let seed = pch_pdb_seed(env_vars);
+        let arguments = if prefix.is_empty() && suffix.is_empty() {
+            Cow::Borrowed(arguments)
+        } else {
+            let mut combined = prefix;
+            combined.extend_from_slice(arguments);
+            combined.extend(suffix);
+            Cow::Owned(combined)
+        };
+        let parsed = if private_pdb_enabled(env_vars) {
+            parse_arguments_with_private_pdb(&arguments, cwd, self.is_clang, seed.as_deref(), true)
+        } else {
+            match seed {
+                Some(seed) => {
+                    parse_arguments_with_pch_seed(&arguments, cwd, self.is_clang, Some(&seed))
+                }
+                None => parse_arguments(&arguments, cwd, self.is_clang),
+            }
+        };
+        if matches!(&parsed, CompilerArguments::Ok(args) if uses_pch(args))
+            && !env_vars.iter().any(|(key, value)| {
+                env_var_name_matches(key, "SCCACHE_MSVC_PCH_SOURCE_DEPENDENCIES") && value == "1"
+            })
+        {
+            return CompilerArguments::CannotCache(
+                "PCH dependency hashing requires deterministic-input opt-in",
+                None,
+            );
         }
-        let mut combined = prefix;
-        combined.extend_from_slice(arguments);
-        combined.extend(suffix);
-        parse_arguments(&combined, cwd, self.is_clang)
+        parsed
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -138,7 +162,11 @@ impl CCompilerImpl for Msvc {
     {
         generate_compile_commands(path_transformer, executable, parsed_args, cwd, env_vars).map(
             |(command, dist_command, cacheable)| {
-                (CCompileCommand::new(command), dist_command, cacheable)
+                (
+                    CCompileCommand::new(MsvcCompileCommand { inner: command }),
+                    dist_command,
+                    cacheable,
+                )
             },
         )
     }
@@ -318,6 +346,10 @@ ArgData! {
     Output(PathBuf),
     DepFile(PathBuf),
     ProgramDatabase(PathBuf),
+    PchPath(PathBuf),
+    PchCreator(PathBuf),
+    PchConsumer(PathBuf),
+    DisablePch,
     DebugInfo,
     PassThrough, // Miscellaneous flags that don't prevent caching.
     PassThroughWithPath(PathBuf), // As above, recognised by prefix.
@@ -374,7 +406,7 @@ msvc_args!(static ARGS: [ArgInfo<ArgData>; _] = [
     msvc_take_arg!("Fi", PathBuf, Concatenated, TooHardPath),
     msvc_take_arg!("Fm", PathBuf, Concatenated, PassThroughWithPath), // No effect if /c is specified.
     msvc_take_arg!("Fo", PathBuf, Concatenated, Output),
-    msvc_take_arg!("Fp", PathBuf, Concatenated, TooHardPath), // allows users to specify the name for a PCH (when using /Yu or /Yc), PCHs are not supported in sccache.
+    msvc_take_arg!("Fp", PathBuf, Concatenated, PchPath),
     msvc_take_arg!("Fr", PathBuf, Concatenated, TooHardPath),
     msvc_take_arg!("Ft", PathBuf, Concatenated, TooHardPath), // #import include paths - not yet supported.
     msvc_flag!("Fx", TooHardFlag),
@@ -472,11 +504,12 @@ msvc_args!(static ARGS: [ArgInfo<ArgData>; _] = [
     msvc_take_arg!("Wv:", OsString, Concatenated, PassThroughWithSuffix),
     msvc_flag!("X", PassThrough),
     msvc_take_arg!("Xclang", OsString, Separated, XClang),
-    msvc_flag!("Y-", PassThrough), // Disable another PCH options
+    msvc_flag!("Y-", DisablePch),
     msvc_take_arg!("YI", OsString, Concatenated, PassThroughWithSuffix), // Has no effect without /Yc
     msvc_flag!("YI-", PassThrough), // Has no effect without /Yc
-    msvc_take_arg!("Yc", PathBuf, Concatenated, TooHardPath), // Compile PCH - not yet supported.
+    msvc_take_arg!("Yc", PathBuf, Concatenated, PchCreator),
     msvc_flag!("Yd", PassThrough),
+    msvc_take_arg!("Yu", PathBuf, Concatenated, PchConsumer),
     msvc_flag!("Z7", PassThrough), // Add debug info to .obj files.
     msvc_take_arg!("ZH:", OsString, Concatenated, PassThroughWithSuffix),
     msvc_flag!("ZI", DebugInfo), // Implies /FC, which puts absolute paths in error messages -> TooHardFlag?
@@ -616,8 +649,6 @@ msvc_args!(static ARGS: [ArgInfo<ArgData>; _] = [
     take_arg!("@", PathBuf, Concatenated, TooHardPath),
 ]);
 
-// TODO: what to do with precompiled header flags? eg: /Yc, /YI, /Yu
-
 /// Options from `CL` are prepended and options from `_CL_` are appended.
 /// The first `#` in each token stands for `=`.
 fn cl_env_args(
@@ -663,6 +694,70 @@ pub fn parse_arguments(
     cwd: &Path,
     is_clang: bool,
 ) -> CompilerArguments<ParsedArguments> {
+    parse_arguments_with_pch_seed(arguments, cwd, is_clang, None)
+}
+
+fn pch_pdb_seed(env_vars: &[(OsString, OsString)]) -> Option<PathBuf> {
+    env_vars
+        .iter()
+        .find(|(key, value)| env_var_name_matches(key, "SCCACHE_MSVC_PCH_PDB") && !value.is_empty())
+        .map(|(_, value)| PathBuf::from(value))
+}
+
+fn private_pdb_enabled(env_vars: &[(OsString, OsString)]) -> bool {
+    env_vars
+        .iter()
+        .any(|(key, value)| env_var_name_matches(key, "SCCACHE_MSVC_PRIVATE_PDB") && value == "1")
+}
+
+fn same_windows_path(left: &Path, right: &Path) -> bool {
+    fn resolve(path: &Path) -> PathBuf {
+        path.canonicalize().unwrap_or_else(|_| {
+            path.parent()
+                .and_then(|parent| parent.canonicalize().ok())
+                .map(|parent| parent.join(path.file_name().unwrap_or_default()))
+                .unwrap_or_else(|| path.to_owned())
+        })
+    }
+    resolve(left).as_os_str().to_string_lossy().to_lowercase()
+        == resolve(right).as_os_str().to_string_lossy().to_lowercase()
+}
+
+fn uses_pch(parsed_args: &ParsedArguments) -> bool {
+    let args = &parsed_args.common_args;
+    // cl gives /Yc precedence over /Yu regardless of their order.
+    !args.iter().any(|arg| {
+        let arg = arg.to_string_lossy();
+        arg == "-Y-" || arg == "/Y-" || arg.starts_with("-Yc") || arg.starts_with("/Yc")
+    }) && args.iter().any(|arg| {
+        let arg = arg.to_string_lossy();
+        arg.starts_with("-Yu") || arg.starts_with("/Yu")
+    })
+}
+
+fn pdb_is_per_object(pdb: &Path, object: &Path, cwd: &Path) -> bool {
+    let mut appended_pdb = object.as_os_str().to_owned();
+    appended_pdb.push(".pdb");
+    same_windows_path(&cwd.join(pdb), &cwd.join(object.with_extension("pdb")))
+        || same_windows_path(&cwd.join(pdb), &cwd.join(PathBuf::from(appended_pdb)))
+}
+
+fn parse_arguments_with_pch_seed(
+    arguments: &[OsString],
+    cwd: &Path,
+    is_clang: bool,
+    pch_seed: Option<&Path>,
+) -> CompilerArguments<ParsedArguments> {
+    parse_arguments_with_private_pdb(arguments, cwd, is_clang, pch_seed, false)
+}
+
+fn parse_arguments_with_private_pdb(
+    arguments: &[OsString],
+    cwd: &Path,
+    is_clang: bool,
+    pch_seed: Option<&Path>,
+    private_pdb: bool,
+) -> CompilerArguments<ParsedArguments> {
     let mut output_arg = None;
     let mut input_arg = None;
     let mut explicit_language = None;
@@ -676,6 +771,10 @@ pub fn parse_arguments(
     let mut compilation_flag = OsString::new();
     let mut debug_info = false;
     let mut pdb = None;
+    let mut pch = None;
+    let mut creates_pch = false;
+    let mut uses_pch = false;
+    let mut disable_pch = false;
     let mut depfile = None;
     let mut show_includes = false;
     let mut xclangs: Vec<OsString> = vec![];
@@ -719,6 +818,10 @@ pub fn parse_arguments(
             }
             Some(DepFile(p)) => depfile = Some(p.clone()),
             Some(ProgramDatabase(p)) => pdb = Some(p.clone()),
+            Some(PchPath(p)) => pch = Some(p.clone()),
+            Some(PchCreator(_)) => creates_pch = true,
+            Some(PchConsumer(_)) => uses_pch = true,
+            Some(DisablePch) => disable_pch = true,
             Some(DebugInfo) => debug_info = true,
             Some(PreprocessorArgument(_))
             | Some(PreprocessorArgumentPath(_))
@@ -776,6 +879,10 @@ pub fn parse_arguments(
                         .iter_os_strings(),
                 ),
             Some(ProgramDatabase(_))
+            | Some(PchPath(_))
+            | Some(PchCreator(_))
+            | Some(PchConsumer(_))
+            | Some(DisablePch)
             | Some(ClangModuleFile(_))
             | Some(ClangModuleOutput(_))
             | Some(ClangLanguage(_))
@@ -1030,6 +1137,65 @@ pub fn parse_arguments(
             },
         );
     }
+    let consumer_seed = if uses_pch && !creates_pch && !disable_pch {
+        if is_clang {
+            cannot_cache!("clang PCH");
+        }
+        let Some(seed) = pch_seed else {
+            cannot_cache!("-Yu");
+        };
+        if !debug_info {
+            cannot_cache!("PCH PDB seed without /Zi or /ZI");
+        }
+        let Some(pch_path) = pch.as_ref().filter(|p| !p.as_os_str().is_empty()) else {
+            cannot_cache!("PCH without explicit /Fp");
+        };
+        let pch_path = if pch_path.extension().is_none() {
+            pch_path.with_extension("pch")
+        } else {
+            pch_path.clone()
+        };
+        let seed = cwd.join(seed);
+        if !seed.is_file() {
+            cannot_cache!("PCH PDB seed missing");
+        }
+        if !cwd.join(&pch_path).is_file() {
+            cannot_cache!("PCH file missing");
+        }
+        // Neither mutable /Fd output nor textual preprocessing is a substitute
+        // for the actual PCH state and genuine, immutable creator database.
+        extra_hash_files.push(cwd.join(pch_path));
+        extra_hash_files.push(seed.clone());
+        Some(seed)
+    } else {
+        None
+    };
+    if creates_pch && !disable_pch {
+        if is_clang {
+            cannot_cache!("clang PCH");
+        }
+        let Some(path) = pch.filter(|p| !p.as_os_str().is_empty()) else {
+            cannot_cache!("PCH without explicit /Fp");
+        };
+        if private_pdb
+            && (path.as_os_str().to_string_lossy().ends_with(['\\', '/'])
+                || cwd.join(&path).is_dir())
+        {
+            cannot_cache!("private PCH outputs must be distinct");
+        }
+        let path = if path.extension().is_none() {
+            path.with_extension("pch")
+        } else {
+            path
+        };
+        outputs.insert(
+            "pch",
+            ArtifactDescriptor {
+                path,
+                optional: false,
+            },
+        );
+    }
     // -Fd is not taken into account unless -Zi or -ZI are given
     // Clang is currently unable to generate PDB files
     if debug_info && !is_clang {
@@ -1050,6 +1216,48 @@ pub fn parse_arguments(
                 } else {
                     p
                 };
+
+                // This must precede preprocessing and cache lookup, not just cache
+                // writes: a cache hit could replace a shared PDB with one
+                // containing only this input's types.
+                if let Some(seed) = &consumer_seed {
+                    if !pdb_is_per_object(&path, &outputs["obj"].path, cwd) {
+                        cannot_cache!("PCH PDB must be per object");
+                    }
+                    if same_windows_path(seed, &cwd.join(&path)) {
+                        cannot_cache!("PCH PDB seed is output");
+                    }
+                } else if private_pdb {
+                    if !pdb_is_per_object(&path, &outputs["obj"].path, cwd) {
+                        cannot_cache!("private PDB must be per object");
+                    }
+                    if let Some(pch) = outputs.get("pch") {
+                        let pch_path = cwd.join(&pch.path);
+                        if pch
+                            .path
+                            .as_os_str()
+                            .to_string_lossy()
+                            .ends_with(['\\', '/'])
+                            || pch_path.is_dir()
+                            || same_windows_path(&pch_path, &cwd.join(&path))
+                            || same_windows_path(&pch_path, &cwd.join(&outputs["obj"].path))
+                        {
+                            cannot_cache!("private PCH outputs must be distinct");
+                        }
+                        if let Some(seed) = pch_seed
+                            && (same_windows_path(&cwd.join(seed), &cwd.join(&path))
+                                || same_windows_path(&cwd.join(seed), &pch_path)
+                                || same_windows_path(
+                                    &cwd.join(seed),
+                                    &cwd.join(&outputs["obj"].path),
+                                ))
+                        {
+                            cannot_cache!("private PCH output is seed");
+                        }
+                    }
+                } else if cwd.join(&path).exists() {
+                    cannot_cache!("shared pdb");
+                }
 
                 outputs.insert(
                     "pdb",
@@ -1089,7 +1297,11 @@ pub fn parse_arguments(
         // FIXME: implement color_mode for msvc.
         color_mode: ColorMode::Auto,
         suppress_rewrite_includes_only: false,
-        too_hard_for_preprocessor_cache_mode: None,
+        // A syntax-only dependency pass is required on every /Yu lookup.
+        // Generic textual-preprocessor manifests cannot describe its PCH state.
+        too_hard_for_preprocessor_cache_mode: consumer_seed
+            .as_ref()
+            .map(|_| "MSVC PCH semantic dependencies".into()),
     })
 }
 
@@ -1143,8 +1355,85 @@ fn msvc_input_arg(parsed_args: &ParsedArguments, input: &OsStr) -> OsString {
     arg
 }
 
+fn preprocessing_arguments(
+    parsed_args: &ParsedArguments,
+    may_dist: bool,
+    rewrite_includes_only: bool,
+    is_clang: bool,
+) -> Vec<OsString> {
+    // When performing distributed compilation, line number info is important for error
+    // reporting and to not cause spurious compilation failure (e.g. no exceptions build
+    // fails due to exceptions transitively included in the stdlib).
+    // With -fprofile-generate line number information is important, so use -E.
+    // Otherwise, use -EP to maximize cache hits (because no absolute file paths are
+    // emitted) and improve performance.
+    let pch_consumer = !is_clang && uses_pch(parsed_args);
+    let mut arguments = if pch_consumer {
+        vec![OsString::from("-Zs")]
+    } else if may_dist || parsed_args.profile_generate {
+        vec![OsString::from("-E")]
+    } else {
+        vec![OsString::from("-EP")]
+    };
+
+    arguments.push("-nologo".into());
+    arguments.extend_from_slice(&parsed_args.preprocessor_args);
+    arguments.extend_from_slice(&parsed_args.dependency_args);
+    arguments.extend(
+        parsed_args
+            .common_args
+            .iter()
+            .filter(|arg| {
+                // /Fd is an output even during preprocessing. Keep /Zi and /ZI,
+                // which can affect predefined macros, but never touch the real PDB.
+                // MSVC scans append /WX- below. Remove overridden /WX switches
+                // here to avoid D9025 without changing actual compilation.
+                let arg = arg.to_string_lossy();
+                is_clang
+                    || !(arg.starts_with("-Fd")
+                        || arg.starts_with("/Fd")
+                        || matches!(arg.as_ref(), "-WX" | "/WX" | "-WX-" | "/WX-"))
+            })
+            .cloned(),
+    );
+
+    if is_clang {
+        if parsed_args.depfile.is_some() && !parsed_args.msvc_show_includes {
+            arguments.push("-showIncludes".into());
+        }
+    } else {
+        // cl.exe can product the dep list itself, in a JSON format that some tools will be expecting.
+        if let Some(ref depfile) = parsed_args.depfile
+            && !pch_consumer
+        {
+            arguments.push("/sourceDependencies".into());
+            arguments.push(depfile.as_os_str().to_owned());
+        }
+        // Windows SDK generates C4668 during preprocessing, but compiles fine.
+        // Read for more info: https://github.com/mozilla/sccache/issues/1725
+        // And here: https://github.com/mozilla/sccache/issues/2250
+        arguments.push("/WX-".into());
+    }
+
+    if rewrite_includes_only && is_clang {
+        arguments.push("-clang:-frewrite-includes".into());
+    }
+    if !is_clang && parsed_args.outputs.contains_key("pch") {
+        // Creators hash their genuine textual input without producing a PCH.
+        // Consumers must retain /Yu: even /E without /Y- ignores the PCH state.
+        arguments.push("-Y-".into());
+    }
+
+    if parsed_args.double_dash_input {
+        arguments.push("--".into());
+    }
+    arguments.push(msvc_input_arg(parsed_args, parsed_args.input.as_os_str()));
+    arguments
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-fn preprocess_cmd<T>(
+fn preprocess_cmd<T: RunCommand>(
     cmd: &mut T,
     parsed_args: &ParsedArguments,
     cwd: &Path,
@@ -1152,53 +1441,301 @@ fn preprocess_cmd<T>(
     may_dist: bool,
     rewrite_includes_only: bool,
     is_clang: bool,
-) where
-    T: RunCommand,
-{
-    // When performing distributed compilation, line number info is important for error
-    // reporting and to not cause spurious compilation failure (e.g. no exceptions build
-    // fails due to exceptions transitively included in the stdlib).
-    // With -fprofile-generate line number information is important, so use -E.
-    // Otherwise, use -EP to maximize cache hits (because no absolute file paths are
-    // emitted) and improve performance.
-    if may_dist || parsed_args.profile_generate {
-        cmd.arg("-E");
-    } else {
-        cmd.arg("-EP");
+) {
+    cmd.args(&preprocessing_arguments(
+        parsed_args,
+        may_dist,
+        rewrite_includes_only,
+        is_clang,
+    ))
+    .env_clear()
+    .envs(without_cl_env_vars(env_vars))
+    .current_dir(cwd);
+}
+
+#[cfg(windows)]
+const MSVC_COMMAND_LINE_LIMIT: Option<usize> = Some(32_000);
+#[cfg(not(windows))]
+const MSVC_COMMAND_LINE_LIMIT: Option<usize> = None;
+
+fn msvc_command_line_len(executable: &Path, arguments: &[OsString]) -> usize {
+    let length = |argument: &OsStr| {
+        let argument = argument.to_string_lossy();
+        argument.encode_utf16().count()
+            + argument.chars().filter(|c| matches!(c, '\\' | '"')).count()
+            + 3
+    };
+    length(executable.as_os_str()) + arguments.iter().map(|arg| length(arg)).sum::<usize>()
+}
+
+fn msvc_response_file_contents(arguments: &[OsString]) -> Result<Vec<u8>> {
+    let mut contents = String::new();
+    for argument in arguments {
+        let argument = argument
+            .to_str()
+            .context("Non-Unicode MSVC response-file argument")?;
+        if argument.contains(['\r', '\n', '\0']) {
+            bail!("MSVC response-file argument contains a line break or NUL");
+        }
+        contents.push('"');
+        let mut backslashes = 0;
+        for character in argument.chars() {
+            if character == '\\' {
+                backslashes += 1;
+                continue;
+            }
+            contents.extend(std::iter::repeat_n(
+                '\\',
+                if character == '"' {
+                    2 * backslashes + 1
+                } else {
+                    backslashes
+                },
+            ));
+            contents.push(character);
+            backslashes = 0;
+        }
+        contents.extend(std::iter::repeat_n('\\', 2 * backslashes));
+        // cl's /sourceDependencies requires its separated value on this line.
+        contents.push_str("\" ");
+    }
+    // cl's ANSI response-file default cannot represent arbitrary paths/macros.
+    // A UTF-16LE BOM is explicit and round-trips non-BMP characters as well.
+    Ok(std::iter::once(0xfeff_u16)
+        .chain(contents.encode_utf16())
+        .flat_map(u16::to_le_bytes)
+        .collect())
+}
+
+fn msvc_arguments_for_spawn(
+    executable: &Path,
+    arguments: &[OsString],
+    directory: &Path,
+    limit: Option<usize>,
+) -> Result<(Vec<OsString>, Option<tempfile::NamedTempFile>)> {
+    let length = msvc_command_line_len(executable, arguments);
+    if !matches!(limit, Some(limit) if length > limit) {
+        return Ok((arguments.to_vec(), None));
+    }
+    let contents = msvc_response_file_contents(arguments)?;
+    let mut response = tempfile::Builder::new()
+        .prefix("sccache-msvc-")
+        .suffix(".rsp")
+        .tempfile_in(directory)
+        .context("Failed to create an owned MSVC response file")?;
+    response.write_all(&contents)?;
+    response.flush()?;
+    let mut argument = OsString::from("@");
+    argument.push(response.path());
+    let arguments = vec![argument];
+    if matches!(limit, Some(limit) if msvc_command_line_len(executable, &arguments) > limit) {
+        bail!("MSVC response-file command itself exceeds the process limit");
+    }
+    debug!(
+        "MSVC command of {length} UTF16 units uses owned response file {}",
+        response.path().display()
+    );
+    Ok((arguments, Some(response)))
+}
+
+#[derive(Debug)]
+struct MsvcCompileCommand {
+    inner: SingleCompileCommand,
+}
+
+#[async_trait]
+impl CompileCommandImpl for MsvcCompileCommand {
+    fn get_executable(&self) -> PathBuf {
+        self.inner.get_executable()
+    }
+    fn get_arguments(&self) -> Vec<OsString> {
+        self.inner.get_arguments()
+    }
+    fn get_env_vars(&self) -> Vec<(OsString, OsString)> {
+        self.inner.get_env_vars()
+    }
+    fn get_cwd(&self) -> PathBuf {
+        self.inner.get_cwd()
     }
 
-    cmd.arg("-nologo")
-        .args(&parsed_args.preprocessor_args)
-        .args(&parsed_args.dependency_args)
-        .args(&parsed_args.common_args)
+    async fn execute<T>(
+        &self,
+        service: &crate::server::SccacheService<T>,
+        creator: &T,
+    ) -> Result<process::Output>
+    where
+        T: CommandCreatorSync,
+    {
+        let (arguments, _response_file) = msvc_arguments_for_spawn(
+            &self.inner.executable,
+            &self.inner.arguments,
+            &self.inner.cwd,
+            MSVC_COMMAND_LINE_LIMIT,
+        )?;
+        let command = SingleCompileCommand {
+            executable: self.inner.executable.clone(),
+            arguments,
+            env_vars: self.inner.env_vars.clone(),
+            cwd: self.inner.cwd.clone(),
+            share_jobserver: self.inner.share_jobserver,
+        };
+        command.execute(service, creator).await
+    }
+}
+
+fn copy_pdb_seed(seed: &Path, output: &Path) -> Result<()> {
+    let temporary =
+        tempfile::NamedTempFile::new_in(output.parent().context("PDB output has no parent")?)?;
+    let permissions = temporary.as_file().metadata()?.permissions();
+    std::fs::copy(seed, temporary.path()).context("Failed to seed private compiler PDB")?;
+    std::fs::set_permissions(temporary.path(), permissions)?;
+    temporary.persist(output).map_err(|error| error.error)?;
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct MsvcSourceDependencies {
+    version: String,
+    data: MsvcSourceDependencyData,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct MsvcSourceDependencyData {
+    source: PathBuf,
+    #[serde(rename = "PCH")]
+    pch: PathBuf,
+    includes: Vec<PathBuf>,
+    #[serde(default)]
+    provided_module: String,
+    imported_modules: Vec<serde_json::Value>,
+    imported_header_units: Vec<serde_json::Value>,
+}
+
+fn pch_dependency_fingerprint(
+    parsed_args: &ParsedArguments,
+    cwd: &Path,
+    dependencies: &[u8],
+) -> Result<Vec<u8>> {
+    let dependencies: MsvcSourceDependencies = serde_json::from_slice(
+        dependencies
+            .strip_prefix(b"\xef\xbb\xbf")
+            .unwrap_or(dependencies),
+    )
+    .context("Invalid MSVC PCH source dependencies")?;
+    if dependencies.version != "1.2" {
+        bail!("Unsupported MSVC PCH source-dependency version");
+    }
+    let data = dependencies.data;
+    if !data.provided_module.is_empty()
+        || !data.imported_modules.is_empty()
+        || !data.imported_header_units.is_empty()
+    {
+        bail!("MSVC PCH source dependencies contain unsupported modules");
+    }
+    if !same_windows_path(&cwd.join(&data.source), &cwd.join(&parsed_args.input))
+        || !parsed_args
+            .extra_hash_files
+            .iter()
+            .any(|path| same_windows_path(&cwd.join(&data.pch), &cwd.join(path)))
+    {
+        bail!("MSVC source dependencies do not match the tracked source and PCH");
+    }
+    let mut files = data.includes;
+    files.push(data.source);
+    let mut files: Vec<_> = files
+        .into_iter()
+        .map(|path| cwd.join(path).canonicalize())
+        .collect::<std::io::Result<_>>()?;
+    files.sort();
+    files.dedup();
+    let mut volatile = false;
+    let mut fingerprints = Vec::with_capacity(files.len());
+    for path in files {
+        let (digest, time_macros) = Digest::reader_sync_time_macros(File::open(&path)?)?;
+        volatile |= time_macros.found_time_macros();
+        fingerprints.push((path, digest));
+    }
+    // Unlike textual preprocessing, raw dependency hashes do not expand /D or
+    // /FI. Include their exact arguments as well as every consumed file's bytes.
+    let mut output = b"sccache-msvc-pch-source-dependencies-v1\0".to_vec();
+    output.extend(serde_json::to_vec(&(
+        fingerprints,
+        &parsed_args.preprocessor_args,
+        &parsed_args.common_args,
+    ))?);
+    for argument in parsed_args
+        .preprocessor_args
+        .iter()
+        .chain(&parsed_args.common_args)
+    {
+        volatile |= Digest::reader_sync_time_macros(argument.to_string_lossy().as_bytes())?
+            .1
+            .found_time_macros();
+    }
+    if volatile {
+        // Never reuse a raw-input cache entry for directly observed time macros.
+        // The opt-in additionally excludes volatile aliases hidden in the PCH.
+        output.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+    }
+    Ok(output)
+}
+
+async fn pch_dependency_hash<T: CommandCreatorSync>(
+    creator: &T,
+    executable: &Path,
+    parsed_args: &ParsedArguments,
+    cwd: &Path,
+    env_vars: &[(OsString, OsString)],
+) -> Result<process::Output> {
+    let seed = pch_pdb_seed(env_vars).context("PCH dependency scan requires a genuine PDB seed")?;
+    let directory = tempfile::Builder::new()
+        .prefix("sccache-pch-scan-")
+        .tempdir_in(cwd)?;
+    let pdb = directory.path().join("scan.pdb");
+    let dependencies = directory.path().join("dependencies.json");
+    copy_pdb_seed(&cwd.join(seed), &pdb)?;
+    let mut arguments = preprocessing_arguments(parsed_args, false, false, false);
+    let mut fd = OsString::from("-Fd");
+    fd.push(&pdb);
+    arguments.push(fd);
+    arguments.push("-sourceDependencies".into());
+    arguments.push(dependencies.as_os_str().to_owned());
+    let (arguments, _response_file) =
+        msvc_arguments_for_spawn(executable, &arguments, cwd, MSVC_COMMAND_LINE_LIMIT)?;
+    let mut command = creator.clone().new_command_sync(executable);
+    command
+        .args(&arguments)
         .env_clear()
         .envs(without_cl_env_vars(env_vars))
         .current_dir(cwd);
-
-    if is_clang {
-        if parsed_args.depfile.is_some() && !parsed_args.msvc_show_includes {
-            cmd.arg("-showIncludes");
+    debug!("PCH-aware syntax dependency scan: {command:?}");
+    let mut output = match run_input_output(command, None).await {
+        Ok(output) => output,
+        Err(error) => {
+            return match error.downcast::<ProcessError>() {
+                Ok(ProcessError(mut output)) => {
+                    // cl /Zs emits diagnostics on stdout, unlike its /E token stream.
+                    output.stderr.extend_from_slice(&output.stdout);
+                    output.stdout.clear();
+                    Err(ProcessError(output).into())
+                }
+                Err(error) => Err(error),
+            };
         }
-    } else {
-        // cl.exe can product the dep list itself, in a JSON format that some tools will be expecting.
-        if let Some(ref depfile) = parsed_args.depfile {
-            cmd.arg("/sourceDependencies");
-            cmd.arg(depfile);
-        }
-        // Windows SDK generates C4668 during preprocessing, but compiles fine.
-        // Read for more info: https://github.com/mozilla/sccache/issues/1725
-        // And here: https://github.com/mozilla/sccache/issues/2250
-        cmd.arg("/WX-");
+    };
+    let dependencies = std::fs::read(&dependencies)
+        .context("MSVC did not produce PCH-aware source dependencies")?;
+    let fingerprint = pch_dependency_fingerprint(parsed_args, cwd, &dependencies)?;
+    if let Some(depfile) = &parsed_args.depfile {
+        std::fs::write(cwd.join(depfile), &dependencies)?;
     }
-
-    if rewrite_includes_only && is_clang {
-        cmd.arg("-clang:-frewrite-includes");
-    }
-
-    if parsed_args.double_dash_input {
-        cmd.arg("--");
-    }
-    cmd.arg(msvc_input_arg(parsed_args, parsed_args.input.as_os_str()));
+    // Cached /showIncludes must use this invocation's true post-PCH includes,
+    // not the old compile's include list or any shadow header.
+    output.stderr.extend_from_slice(&output.stdout);
+    output.stdout = fingerprint;
+    Ok(output)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1216,16 +1753,30 @@ pub async fn preprocess<T>(
 where
     T: CommandCreatorSync,
 {
+    if !is_clang && uses_pch(parsed_args) {
+        return pch_dependency_hash(creator, executable, parsed_args, cwd, env_vars).await;
+    }
+    // Keep preprocessing separate from compilation's output database without
+    // changing debug flags and their predefined macros.
+    let preprocessing_pdb = if !is_clang && parsed_args.outputs.contains_key("pdb") {
+        Some(tempfile::Builder::new().prefix("sccache-pdb").tempdir()?)
+    } else {
+        None
+    };
+    let mut arguments =
+        preprocessing_arguments(parsed_args, may_dist, rewrite_includes_only, is_clang);
+    if let Some(directory) = &preprocessing_pdb {
+        let mut fd = OsString::from("-Fd");
+        fd.push(directory.path().join("preprocess.pdb"));
+        arguments.push(fd);
+    }
+    let (arguments, _response_file) =
+        msvc_arguments_for_spawn(executable, &arguments, cwd, MSVC_COMMAND_LINE_LIMIT)?;
     let mut cmd = creator.clone().new_command_sync(executable);
-    preprocess_cmd(
-        &mut cmd,
-        parsed_args,
-        cwd,
-        env_vars,
-        may_dist,
-        rewrite_includes_only,
-        is_clang,
-    );
+    cmd.args(&arguments)
+        .env_clear()
+        .envs(without_cl_env_vars(env_vars))
+        .current_dir(cwd);
 
     if log_enabled!(Debug) {
         debug!("preprocess: {:?}", cmd);
@@ -1321,19 +1872,48 @@ fn generate_compile_commands(
         None => bail!("Missing object file output"),
     };
 
+    let consumer_seed = if uses_pch(parsed_args) {
+        pch_pdb_seed(&env_vars)
+    } else {
+        None
+    };
     // See if this compilation will produce a PDB.
-    let cacheable = parsed_args
-        .outputs
-        .get("pdb")
-        .map_or(Cacheable::Yes, |pdb| {
-            // If the PDB exists, we don't know if it's shared with another
-            // compilation. If it is, we can't cache.
-            if Path::new(&cwd).join(pdb.path.clone()).exists() {
-                Cacheable::No
-            } else {
-                Cacheable::Yes
-            }
-        });
+    let cacheable = if let Some(seed) = consumer_seed {
+        let output = cwd.join(&parsed_args.outputs["pdb"].path);
+        // This is reached only on a cache miss. Replace the private /Fd output
+        // atomically so even an old hard link cannot modify the creator PDB.
+        copy_pdb_seed(&cwd.join(seed), &output)?;
+        Cacheable::Yes
+    } else if private_pdb_enabled(&env_vars)
+        && !uses_pch(parsed_args)
+        && let Some(pdb) = parsed_args.outputs.get("pdb")
+    {
+        if !pdb_is_per_object(&pdb.path, out_file, cwd) {
+            bail!("private PDB must be per object");
+        }
+        // Only a cache miss resets this independently owned compiler output.
+        // cl then generates a fresh genuine PDB, not incremental state from
+        // another source generation that is absent from the cache key.
+        match std::fs::remove_file(cwd.join(&pdb.path)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("Failed to reset private compiler PDB"),
+        }
+        Cacheable::Yes
+    } else {
+        parsed_args
+            .outputs
+            .get("pdb")
+            .map_or(Cacheable::Yes, |pdb| {
+                // If the PDB exists, we don't know if it's shared with another
+                // compilation. If it is, we can't cache.
+                if Path::new(&cwd).join(pdb.path.clone()).exists() {
+                    Cacheable::No
+                } else {
+                    Cacheable::Yes
+                }
+            })
+    };
 
     let mut fo = OsString::from("-Fo");
     fo.push(out_file);
@@ -1359,6 +1939,10 @@ fn generate_compile_commands(
     let dist_command = None;
     #[cfg(feature = "dist-client")]
     let dist_command = (|| {
+        // MSVC PCHs contain machine-local compiler state and PDB paths.
+        if parsed_args.outputs.contains_key("pch") || uses_pch(parsed_args) {
+            return None;
+        }
         // http://releases.llvm.org/6.0.0/tools/clang/docs/UsersManual.html#clang-cl
         // TODO: Use /T... for language?
         let mut fo = String::from("-Fo");
@@ -3063,14 +3647,955 @@ mod test {
         );
 
         assert_eq!(
-            CompilerArguments::CannotCache("-Fp", None),
-            parse_arguments(ovec!["-c", "-Fpfoo.h", "foo.c"])
-        );
-
-        assert_eq!(
-            CompilerArguments::CannotCache("-Yc", None),
+            CompilerArguments::CannotCache("PCH without explicit /Fp", None),
             parse_arguments(ovec!["-c", "-Ycfoo.h", "foo.c"])
         );
+        for args in [
+            ovec!["-c", "-Yufoo.h", "foo.c"],
+            ovec!["/c", "/Fppch.pch", "/Yupch.h", "foo.c"],
+            ovec!["/c", "/Yupch.h", "/Fppch.pch", "foo.c"],
+        ] {
+            assert_eq!(
+                CompilerArguments::CannotCache("-Yu", None),
+                parse_arguments(args)
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_arguments_inactive_pch_path() {
+        let args = match parse_arguments(ovec!["/c", "/Fpabsent.pch", "foo.c"]) {
+            CompilerArguments::Ok(args) => args,
+            other => panic!("unexpected parse result: {other:?}"),
+        };
+        assert_eq!(args.common_args, ovec!["/Fpabsent.pch"]);
+        assert!(args.extra_hash_files.is_empty());
+        assert!(!args.outputs.contains_key("pch"));
+        for flags in [
+            ovec!["/Y-", "/Ycpch.h"],
+            ovec!["/Ycpch.h", "/Y-"],
+            ovec!["/Y-", "/Yupch.h"],
+            ovec!["/Yupch.h", "/Y-"],
+        ] {
+            let mut arguments = ovec!["/c", "/Fpabsent.pch", "foo.c"];
+            arguments.extend(flags);
+            let args = match parse_arguments(arguments) {
+                CompilerArguments::Ok(args) => args,
+                other => panic!("unexpected parse result: {other:?}"),
+            };
+            assert!(!args.outputs.contains_key("pch"));
+            assert!(args.extra_hash_files.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_pch_creator_outputs_and_preprocessing() {
+        for flags in [ovec!["/Ycpch.h", "/Yupch.h"], ovec!["/Yupch.h", "/Ycpch.h"]] {
+            let mut arguments = ovec![
+                "/c",
+                "/Fppch.pch",
+                "/Zi",
+                "/Fdunique.pdb",
+                "/Fopch.obj",
+                "pch.cpp"
+            ];
+            arguments.extend(flags);
+            let args = match parse_arguments(arguments) {
+                CompilerArguments::Ok(args) => args,
+                other => panic!("unexpected parse result: {other:?}"),
+            };
+            assert!(args.outputs.contains_key("pch"));
+            assert!(args.extra_hash_files.is_empty());
+            assert!(!uses_pch(&args));
+        }
+        for (fp, expected_path) in [("/Fppch.pch", "pch.pch"), ("/Fppch", "pch.pch")] {
+            let args = match parse_arguments(ovec![
+                "/c",
+                "/Ycpch.h",
+                fp,
+                "/Zi",
+                "/Fdunique.pdb",
+                "/Fopch.obj",
+                "pch.cpp"
+            ]) {
+                CompilerArguments::Ok(args) => args,
+                other => panic!("unexpected parse result: {other:?}"),
+            };
+            assert_eq!(args.outputs["pch"].path, Path::new(expected_path));
+            assert!(!args.outputs["pch"].optional);
+            assert_eq!(args.outputs["pdb"].path, Path::new("unique.pdb"));
+            assert_eq!(args.outputs["obj"].path, Path::new("pch.obj"));
+            let mut cmd = MockCommand {
+                child: None,
+                args: vec![],
+            };
+            preprocess_cmd(&mut cmd, &args, Path::new(""), &[], false, false, false);
+            assert_eq!(
+                cmd.args,
+                ovec![
+                    "-EP", "-nologo", "/Ycpch.h", fp, "/Zi", "/WX-", "-Y-", "pch.cpp"
+                ]
+            );
+            let fixture = TestFixture::new();
+            let (command, _, _) = generate_compile_commands(
+                &mut dist::PathTransformer::new(),
+                &fixture.bins[0],
+                &args,
+                fixture.tempdir.path(),
+                &[],
+            )
+            .unwrap();
+            assert!(command.arguments.contains(&OsString::from("/Ycpch.h")));
+            assert!(!command.arguments.contains(&OsString::from("-Y-")));
+        }
+    }
+
+    #[test]
+    fn test_seeded_pch_consumer_dependencies_and_preprocessing() {
+        let fixture = TestFixture::new();
+        let seed = fixture.touch("creator.pdb").unwrap();
+        let pch = fixture.touch("pch.pch").unwrap();
+        fixture.touch("foo.pdb").unwrap();
+        let args = match parse_arguments_with_pch_seed(
+            &[
+                OsString::from("/c"),
+                OsString::from("/Yupch.h"),
+                OsString::from("/Fppch.pch"),
+                OsString::from("/Zi"),
+                OsString::from("/Fdfoo.pdb"),
+                OsString::from("/Fofoo.obj"),
+                OsString::from("foo.cpp"),
+            ],
+            fixture.tempdir.path(),
+            false,
+            Some(&seed),
+        ) {
+            CompilerArguments::Ok(args) => args,
+            other => panic!("unexpected parse result: {other:?}"),
+        };
+        assert_eq!(
+            args.extra_hash_files
+                .iter()
+                .map(|path| path.canonicalize().unwrap())
+                .collect::<Vec<_>>(),
+            vec![pch, seed]
+        );
+        assert!(!args.outputs.contains_key("pch"));
+        assert_eq!(args.outputs["pdb"].path, Path::new("foo.pdb"));
+        let mut cmd = MockCommand {
+            child: None,
+            args: vec![],
+        };
+        preprocess_cmd(
+            &mut cmd,
+            &args,
+            fixture.tempdir.path(),
+            &[],
+            false,
+            false,
+            false,
+        );
+        assert!(cmd.args.contains(&OsString::from("-Zs")));
+        assert!(!cmd.args.contains(&OsString::from("-Y-")));
+        assert!(!cmd.args.contains(&OsString::from("-EP")));
+        assert!(args.too_hard_for_preprocessor_cache_mode.is_some());
+        assert!(!cmd.args.contains(&OsString::from("/Fdfoo.pdb")));
+    }
+
+    #[test]
+    fn test_seeded_pch_consumer_requires_private_outputs() {
+        let fixture = TestFixture::new();
+        let seed = fixture.touch("creator.pdb").unwrap();
+        fixture.touch("pch.pch").unwrap();
+        let args = match parse_arguments_with_pch_seed(
+            &[
+                OsString::from("/c"),
+                OsString::from("/Yupch.h"),
+                OsString::from("/Fppch.pch"),
+                OsString::from("/Zi"),
+                OsString::from("/Fdfoo.obj.pdb"),
+                OsString::from("/Fofoo.obj"),
+                OsString::from("foo.cpp"),
+            ],
+            fixture.tempdir.path(),
+            false,
+            Some(&seed),
+        ) {
+            CompilerArguments::Ok(args) => args,
+            other => panic!("unexpected parse result: {other:?}"),
+        };
+        assert_eq!(args.outputs["pdb"].path, Path::new("foo.obj.pdb"));
+        for (fd, fo, reason) in [
+            ("/Fdshared.pdb", "/Fofoo.obj", "PCH PDB must be per object"),
+            ("/Fdcreator.pdb", "/Focreator.obj", "PCH PDB seed is output"),
+        ] {
+            assert_eq!(
+                CompilerArguments::CannotCache(reason, None),
+                parse_arguments_with_pch_seed(
+                    &[
+                        OsString::from("/c"),
+                        OsString::from("/Yupch.h"),
+                        OsString::from("/Fppch.pch"),
+                        OsString::from("/Zi"),
+                        OsString::from(fd),
+                        OsString::from(fo),
+                        OsString::from("foo.cpp")
+                    ],
+                    fixture.tempdir.path(),
+                    false,
+                    Some(&seed),
+                )
+            );
+        }
+        assert_eq!(
+            CompilerArguments::CannotCache("PCH PDB seed missing", None),
+            parse_arguments_with_pch_seed(
+                &[
+                    OsString::from("/c"),
+                    OsString::from("/Yupch.h"),
+                    OsString::from("/Fppch.pch"),
+                    OsString::from("/Zi"),
+                    OsString::from("/Fdfoo.pdb"),
+                    OsString::from("/Fofoo.obj"),
+                    OsString::from("foo.cpp")
+                ],
+                fixture.tempdir.path(),
+                false,
+                Some(Path::new("missing.pdb")),
+            )
+        );
+    }
+
+    #[test]
+    fn test_seeded_pch_miss_replaces_only_private_pdb() {
+        let fixture = TestFixture::new();
+        let seed = fixture.touch("creator.pdb").unwrap();
+        let output = fixture.touch("foo.pdb").unwrap();
+        fixture.touch("pch.pch").unwrap();
+        std::fs::write(&seed, b"immutable creator fixture").unwrap();
+        std::fs::write(&output, b"old private fixture").unwrap();
+        let seed_permissions = std::fs::metadata(&seed).unwrap().permissions();
+        let mut read_only = seed_permissions.clone();
+        read_only.set_readonly(true);
+        std::fs::set_permissions(&seed, read_only).unwrap();
+        let env = vec![
+            ("SCCACHE_MSVC_PCH_PDB".into(), seed.clone().into_os_string()),
+            ("SCCACHE_MSVC_PCH_SOURCE_DEPENDENCIES".into(), "1".into()),
+        ];
+        let compiler = Msvc {
+            includes_prefix: String::new(),
+            is_clang: false,
+            version: None,
+        };
+        let args = match compiler.parse_arguments(
+            &[
+                OsString::from("/c"),
+                OsString::from("/Yupch.h"),
+                OsString::from("/Fppch.pch"),
+                OsString::from("/Zi"),
+                OsString::from("/Fdfoo.pdb"),
+                OsString::from("/Fofoo.obj"),
+                OsString::from("foo.cpp"),
+            ],
+            fixture.tempdir.path(),
+            &env,
+        ) {
+            CompilerArguments::Ok(args) => args,
+            other => panic!("unexpected parse result: {other:?}"),
+        };
+        let (command, _, cacheable) = generate_compile_commands(
+            &mut dist::PathTransformer::new(),
+            &fixture.bins[0],
+            &args,
+            fixture.tempdir.path(),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(cacheable, Cacheable::Yes);
+        assert_eq!(std::fs::read(&seed).unwrap(), b"immutable creator fixture");
+        assert_eq!(
+            std::fs::read(&output).unwrap(),
+            b"immutable creator fixture"
+        );
+        assert!(!std::fs::metadata(&output).unwrap().permissions().readonly());
+        assert!(std::fs::metadata(&seed).unwrap().permissions().readonly());
+        std::fs::set_permissions(&seed, seed_permissions).unwrap();
+        assert!(command.arguments.contains(&OsString::from("/Yupch.h")));
+        assert!(command.arguments.contains(&OsString::from("/Fdfoo.pdb")));
+        assert!(!command.arguments.contains(&OsString::from("-Y-")));
+    }
+
+    #[test]
+    fn test_private_pdb_optin_and_output_ownership() {
+        let fixture = TestFixture::new();
+        fixture.touch("foo.pdb").unwrap();
+        fixture.touch("foo.obj.pdb").unwrap();
+        fixture.touch("shared.pdb").unwrap();
+        let compiler = Msvc {
+            includes_prefix: String::new(),
+            is_clang: false,
+            version: None,
+        };
+        for fd in ["/Fdfoo.pdb", "/Fdfoo.obj.pdb"] {
+            let arguments = ovec!["/c", "/Zi", fd, "/Fofoo.obj", "foo.cpp"];
+            assert_eq!(
+                compiler.parse_arguments(&arguments, fixture.tempdir.path(), &[]),
+                CompilerArguments::CannotCache("shared pdb", None)
+            );
+            for value in ["0", "true"] {
+                assert_eq!(
+                    compiler.parse_arguments(
+                        &arguments,
+                        fixture.tempdir.path(),
+                        &[("SCCACHE_MSVC_PRIVATE_PDB".into(), value.into())],
+                    ),
+                    CompilerArguments::CannotCache("shared pdb", None)
+                );
+            }
+            assert!(matches!(
+                compiler.parse_arguments(
+                    &arguments,
+                    fixture.tempdir.path(),
+                    &[("sccache_msvc_private_pdb".into(), "1".into())],
+                ),
+                CompilerArguments::Ok(_)
+            ));
+        }
+        let env = vec![("SCCACHE_MSVC_PRIVATE_PDB".into(), "1".into())];
+        for arguments in [
+            ovec!["/c", "/Zi", "/Fdshared.pdb", "/Fofoo.obj", "foo.cpp"],
+            ovec![
+                "/c",
+                "/Zi",
+                "/Fdmissing-shared.pdb",
+                "/Fofoo.obj",
+                "foo.cpp"
+            ],
+        ] {
+            assert_eq!(
+                compiler.parse_arguments(&arguments, fixture.tempdir.path(), &env),
+                CompilerArguments::CannotCache("private PDB must be per object", None)
+            );
+        }
+        let creator_args = match compiler.parse_arguments(
+            &[
+                OsString::from("/c"),
+                OsString::from("/Zi"),
+                OsString::from("/Ycpch.h"),
+                OsString::from("/Fppch.pch"),
+                OsString::from("/Fdfoo.pdb"),
+                OsString::from("/Fofoo.obj"),
+                OsString::from("foo.cpp"),
+            ],
+            fixture.tempdir.path(),
+            &env,
+        ) {
+            CompilerArguments::Ok(args) => args,
+            other => panic!("unexpected parse result: {other:?}"),
+        };
+        assert_eq!(creator_args.outputs["pch"].path, Path::new("pch.pch"));
+        assert_eq!(creator_args.outputs["obj"].path, Path::new("foo.obj"));
+        assert_eq!(creator_args.outputs["pdb"].path, Path::new("foo.pdb"));
+        assert_eq!(
+            compiler.parse_arguments(
+                &[
+                    OsString::from("/c"),
+                    OsString::from("/Zi"),
+                    OsString::from("/Yupch.h"),
+                    OsString::from("/Fppch.pch"),
+                    OsString::from("/Fdfoo.pdb"),
+                    OsString::from("/Fofoo.obj"),
+                    OsString::from("foo.cpp")
+                ],
+                fixture.tempdir.path(),
+                &env,
+            ),
+            CompilerArguments::CannotCache("-Yu", None)
+        );
+    }
+
+    #[test]
+    fn test_private_pdb_miss_resets_only_owned_output() {
+        let fixture = TestFixture::new();
+        let output = fixture.touch("foo.obj.pdb").unwrap();
+        let shared = fixture.touch("shared.pdb").unwrap();
+        std::fs::write(&output, b"previous private generation").unwrap();
+        std::fs::write(&shared, b"unrelated shared database").unwrap();
+        let env = vec![("SCCACHE_MSVC_PRIVATE_PDB".into(), "1".into())];
+        let compiler = Msvc {
+            includes_prefix: String::new(),
+            is_clang: false,
+            version: None,
+        };
+        let args = match compiler.parse_arguments(
+            &[
+                OsString::from("/c"),
+                OsString::from("/Zi"),
+                OsString::from("/Fdfoo.obj.pdb"),
+                OsString::from("/Fofoo.obj"),
+                OsString::from("foo.cpp"),
+            ],
+            fixture.tempdir.path(),
+            &env,
+        ) {
+            CompilerArguments::Ok(args) => args,
+            other => panic!("unexpected parse result: {other:?}"),
+        };
+        let (command, _, cacheable) = generate_compile_commands(
+            &mut dist::PathTransformer::new(),
+            &fixture.bins[0],
+            &args,
+            fixture.tempdir.path(),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(cacheable, Cacheable::Yes);
+        assert!(!output.exists());
+        assert_eq!(std::fs::read(shared).unwrap(), b"unrelated shared database");
+        assert!(command.arguments.contains(&OsString::from("/Zi")));
+        assert!(
+            command
+                .arguments
+                .contains(&OsString::from("/Fdfoo.obj.pdb"))
+        );
+    }
+
+    #[test]
+    fn test_private_pch_creator_requires_distinct_outputs() {
+        let fixture = TestFixture::new();
+        fixture.touch("foo.pdb").unwrap();
+        let compiler = Msvc {
+            includes_prefix: String::new(),
+            is_clang: false,
+            version: None,
+        };
+        let env = vec![("SCCACHE_MSVC_PRIVATE_PDB".into(), "1".into())];
+        for fp in ["/Fpfoo.pdb", "/Fpfoo.obj", "/Fpdir\\"] {
+            assert_eq!(
+                compiler.parse_arguments(
+                    &[
+                        OsString::from("/c"),
+                        OsString::from("/Zi"),
+                        OsString::from("/Ycpch.h"),
+                        OsString::from(fp),
+                        OsString::from("/Fdfoo.pdb"),
+                        OsString::from("/Fofoo.obj"),
+                        OsString::from("foo.cpp")
+                    ],
+                    fixture.tempdir.path(),
+                    &env,
+                ),
+                CompilerArguments::CannotCache("private PCH outputs must be distinct", None)
+            );
+        }
+        assert_eq!(
+            compiler.parse_arguments(
+                &[
+                    OsString::from("/c"),
+                    OsString::from("/Zi"),
+                    OsString::from("/Ycpch.h"),
+                    OsString::from("/Fppch.pch"),
+                    OsString::from("/Fdshared.pdb"),
+                    OsString::from("/Fofoo.obj"),
+                    OsString::from("foo.cpp")
+                ],
+                fixture.tempdir.path(),
+                &env,
+            ),
+            CompilerArguments::CannotCache("private PDB must be per object", None)
+        );
+        let mut env = env;
+        env.push(("SCCACHE_MSVC_PCH_PDB".into(), "foo.pdb".into()));
+        assert_eq!(
+            compiler.parse_arguments(
+                &[
+                    OsString::from("/c"),
+                    OsString::from("/Zi"),
+                    OsString::from("/Ycpch.h"),
+                    OsString::from("/Fppch.pch"),
+                    OsString::from("/Fdfoo.pdb"),
+                    OsString::from("/Fofoo.obj"),
+                    OsString::from("foo.cpp")
+                ],
+                fixture.tempdir.path(),
+                &env,
+            ),
+            CompilerArguments::CannotCache("private PCH output is seed", None)
+        );
+    }
+
+    #[test]
+    fn test_private_pch_miss_resets_only_creator_pdb() {
+        let fixture = TestFixture::new();
+        let pdb = fixture.touch("foo.obj.pdb").unwrap();
+        let pch = fixture.touch("pch.pch").unwrap();
+        let seed = fixture.touch("snapshot.pdb").unwrap();
+        std::fs::write(&pdb, b"old creator generation").unwrap();
+        std::fs::write(&pch, b"previous pch").unwrap();
+        std::fs::write(&seed, b"immutable previous snapshot").unwrap();
+        let env = vec![
+            ("SCCACHE_MSVC_PRIVATE_PDB".into(), "1".into()),
+            ("SCCACHE_MSVC_PCH_PDB".into(), seed.clone().into_os_string()),
+        ];
+        let compiler = Msvc {
+            includes_prefix: String::new(),
+            is_clang: false,
+            version: None,
+        };
+        let args = match compiler.parse_arguments(
+            &[
+                OsString::from("/c"),
+                OsString::from("/Zi"),
+                OsString::from("/Ycpch.h"),
+                OsString::from("/Fppch.pch"),
+                OsString::from("/Fdfoo.obj.pdb"),
+                OsString::from("/Fofoo.obj"),
+                OsString::from("foo.cpp"),
+            ],
+            fixture.tempdir.path(),
+            &env,
+        ) {
+            CompilerArguments::Ok(args) => args,
+            other => panic!("unexpected parse result: {other:?}"),
+        };
+        assert!(args.outputs.contains_key("pch"));
+        assert!(args.extra_hash_files.is_empty());
+        let (command, _, cacheable) = generate_compile_commands(
+            &mut dist::PathTransformer::new(),
+            &fixture.bins[0],
+            &args,
+            fixture.tempdir.path(),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(cacheable, Cacheable::Yes);
+        assert!(!pdb.exists());
+        assert_eq!(std::fs::read(seed).unwrap(), b"immutable previous snapshot");
+        assert_eq!(std::fs::read(pch).unwrap(), b"previous pch");
+        assert!(command.arguments.contains(&OsString::from("/Ycpch.h")));
+        assert!(
+            command
+                .arguments
+                .contains(&OsString::from("/Fdfoo.obj.pdb"))
+        );
+        assert!(!command.arguments.contains(&OsString::from("-Y-")));
+    }
+
+    fn source_dependency_fixture(source: &Path, pch: &Path, includes: &[PathBuf]) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "Version": "1.2",
+            "Data": {
+                "Source": source, "PCH": pch, "ProvidedModule": "",
+                "Includes": includes, "ImportedModules": [], "ImportedHeaderUnits": []
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn test_pch_dependency_key_uses_only_consumed_files_and_defines() {
+        let fixture = TestFixture::new();
+        let source = fixture.touch("foo.cpp").unwrap();
+        let header = fixture.touch("after.h").unwrap();
+        let shadow = fixture.touch("shadow.h").unwrap();
+        let pch = fixture.touch("pch.pch").unwrap();
+        let seed = fixture.touch("seed.pdb").unwrap();
+        std::fs::write(&source, b"#include \"shadow.h\"\nPchType value{VALUE};").unwrap();
+        std::fs::write(&header, b"#define VALUE 11").unwrap();
+        std::fs::write(&shadow, b"#error ignored by real /Yu").unwrap();
+        let mut args = match parse_arguments_with_pch_seed(
+            &[
+                OsString::from("/c"),
+                OsString::from("/Zi"),
+                OsString::from("/Yushadow.h"),
+                OsString::from("/Fppch.pch"),
+                OsString::from("/Fdfoo.pdb"),
+                OsString::from("/Fofoo.obj"),
+                OsString::from("foo.cpp"),
+            ],
+            fixture.tempdir.path(),
+            false,
+            Some(&seed),
+        ) {
+            CompilerArguments::Ok(args) => args,
+            other => panic!("unexpected parse result: {other:?}"),
+        };
+        let dependencies = source_dependency_fixture(&source, &pch, std::slice::from_ref(&header));
+        let first =
+            pch_dependency_fingerprint(&args, fixture.tempdir.path(), &dependencies).unwrap();
+        std::fs::write(&shadow, b"#error different ignored content").unwrap();
+        assert_eq!(
+            first,
+            pch_dependency_fingerprint(&args, fixture.tempdir.path(), &dependencies).unwrap()
+        );
+        std::fs::write(&header, b"#define VALUE 13").unwrap();
+        let changed =
+            pch_dependency_fingerprint(&args, fixture.tempdir.path(), &dependencies).unwrap();
+        assert_ne!(first, changed);
+        args.preprocessor_args.push("/DVALUE=17".into());
+        assert_ne!(
+            changed,
+            pch_dependency_fingerprint(&args, fixture.tempdir.path(), &dependencies).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_pch_dependency_key_rejects_wrong_pch_and_modules() {
+        let fixture = TestFixture::new();
+        let source = fixture.touch("foo.cpp").unwrap();
+        let pch = fixture.touch("tracked.pch").unwrap();
+        let seed = fixture.touch("seed.pdb").unwrap();
+        let args = match parse_arguments_with_pch_seed(
+            &[
+                OsString::from("/c"),
+                OsString::from("/Zi"),
+                OsString::from("/Yupch.h"),
+                OsString::from("/Fptracked.pch"),
+                OsString::from("/Fdfoo.pdb"),
+                OsString::from("/Fofoo.obj"),
+                OsString::from("foo.cpp"),
+            ],
+            fixture.tempdir.path(),
+            false,
+            Some(&seed),
+        ) {
+            CompilerArguments::Ok(args) => args,
+            other => panic!("unexpected parse result: {other:?}"),
+        };
+        let wrong = source_dependency_fixture(&source, Path::new("other.pch"), &[]);
+        assert!(pch_dependency_fingerprint(&args, fixture.tempdir.path(), &wrong).is_err());
+        let mut modules: serde_json::Value =
+            serde_json::from_slice(&source_dependency_fixture(&source, &pch, &[])).unwrap();
+        modules["Data"]["ImportedModules"] = serde_json::json!([{"Name": "untracked"}]);
+        assert!(
+            pch_dependency_fingerprint(
+                &args,
+                fixture.tempdir.path(),
+                &serde_json::to_vec(&modules).unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_pch_dependency_key_does_not_reuse_direct_time_macros() {
+        let fixture = TestFixture::new();
+        let source = fixture.touch("foo.cpp").unwrap();
+        let pch = fixture.touch("pch.pch").unwrap();
+        let seed = fixture.touch("seed.pdb").unwrap();
+        std::fs::write(&source, b"#include \"pch.h\"\nconst char *time = __TIME__;").unwrap();
+        let mut args = match parse_arguments_with_pch_seed(
+            &[
+                OsString::from("/c"),
+                OsString::from("/Zi"),
+                OsString::from("/Yupch.h"),
+                OsString::from("/Fppch.pch"),
+                OsString::from("/Fdfoo.pdb"),
+                OsString::from("/Fofoo.obj"),
+                OsString::from("foo.cpp"),
+            ],
+            fixture.tempdir.path(),
+            false,
+            Some(&seed),
+        ) {
+            CompilerArguments::Ok(args) => args,
+            other => panic!("unexpected parse result: {other:?}"),
+        };
+        let dependencies = source_dependency_fixture(&source, &pch, &[]);
+        assert_ne!(
+            pch_dependency_fingerprint(&args, fixture.tempdir.path(), &dependencies).unwrap(),
+            pch_dependency_fingerprint(&args, fixture.tempdir.path(), &dependencies).unwrap()
+        );
+        std::fs::write(
+            &source,
+            b"#include \"pch.h\"\nconst char *time = COMMAND_TIME;",
+        )
+        .unwrap();
+        args.preprocessor_args
+            .push("/DCOMMAND_TIME=__TIME__".into());
+        assert_ne!(
+            pch_dependency_fingerprint(&args, fixture.tempdir.path(), &dependencies).unwrap(),
+            pch_dependency_fingerprint(&args, fixture.tempdir.path(), &dependencies).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_pch_semantic_dependency_mode_requires_explicit_contract() {
+        let fixture = TestFixture::new();
+        let seed = fixture.touch("seed.pdb").unwrap();
+        fixture.touch("pch.pch").unwrap();
+        let arguments = ovec![
+            "/c",
+            "/Zi",
+            "/Yupch.h",
+            "/Fppch.pch",
+            "/Fdfoo.pdb",
+            "/Fofoo.obj",
+            "foo.cpp"
+        ];
+        let mut env = vec![("SCCACHE_MSVC_PCH_PDB".into(), seed.into_os_string())];
+        let compiler = Msvc {
+            includes_prefix: String::new(),
+            is_clang: false,
+            version: None,
+        };
+        assert_eq!(
+            compiler.parse_arguments(&arguments, fixture.tempdir.path(), &env),
+            CompilerArguments::CannotCache(
+                "PCH dependency hashing requires deterministic-input opt-in",
+                None
+            )
+        );
+        env.push(("SCCACHE_MSVC_PCH_SOURCE_DEPENDENCIES".into(), "1".into()));
+        assert!(matches!(
+            compiler.parse_arguments(&arguments, fixture.tempdir.path(), &env),
+            CompilerArguments::Ok(_)
+        ));
+    }
+
+    #[test]
+    fn test_generated_response_file_unicode_and_quoting() {
+        let arguments = ovec![
+            "",
+            "/Ic:\\public path\\Ω😀\\",
+            "/DVALUE=\"public value\"",
+            "/DBACKSLASH=\\\"quoted\\\"",
+            "foo.cpp",
+            "/sourceDependencies",
+            "public dependencies.json"
+        ];
+        let contents = msvc_response_file_contents(&arguments).unwrap();
+        assert_eq!(&contents[..2], b"\xff\xfe");
+        let text = read_text(&mut &contents[..]).unwrap();
+        assert!(!text.contains(['\r', '\n']));
+        let decoded: Vec<OsString> = SplitMsvcResponseFileArgs::from(&text)
+            .map(OsString::from)
+            .collect();
+        assert_eq!(decoded, arguments);
+        assert!(msvc_response_file_contents(&[OsString::from("/DVALUE=line\nbreak")]).is_err());
+    }
+
+    #[test]
+    fn test_generated_response_file_owned_lifetime() {
+        let fixture = TestFixture::new();
+        let arguments = ovec![format!("/I{}", "x".repeat(55_000)), "/c", "foo.cpp"];
+        let (spawn, response) = msvc_arguments_for_spawn(
+            &fixture.bins[0],
+            &arguments,
+            fixture.tempdir.path(),
+            Some(32_000),
+        )
+        .unwrap();
+        assert_eq!(spawn.len(), 1);
+        let path = PathBuf::from(spawn[0].split_prefix("@").unwrap());
+        assert!(path.is_file());
+        let text = read_text(&mut File::open(&path).unwrap()).unwrap();
+        let decoded: Vec<OsString> = SplitMsvcResponseFileArgs::from(&text)
+            .map(OsString::from)
+            .collect();
+        assert_eq!(decoded, arguments);
+        drop(response);
+        assert!(!path.exists());
+        let short = ovec!["/c", "foo.cpp"];
+        let (spawn, response) = msvc_arguments_for_spawn(
+            &fixture.bins[0],
+            &short,
+            fixture.tempdir.path(),
+            Some(32_000),
+        )
+        .unwrap();
+        assert_eq!(spawn, short);
+        assert!(response.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_long_preprocessing_and_local_compile_use_live_response_files() {
+        let fixture = TestFixture::new();
+        let creator = new_creator();
+        let runtime = single_threaded_runtime();
+        let storage = std::sync::Arc::new(MockStorage::new(None, false));
+        let service = server::SccacheService::mock_with_storage(storage, runtime.handle().clone());
+        let args = match parse_arguments(ovec![
+            "/c",
+            format!("/I{}", "x".repeat(55_000)),
+            "/Fofoo.obj",
+            "foo.cpp"
+        ]) {
+            CompilerArguments::Ok(args) => args,
+            other => panic!("unexpected parse result: {other:?}"),
+        };
+        let paths = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = paths.clone();
+        let expected = preprocessing_arguments(&args, false, false, false);
+        creator.lock().unwrap().next_command_calls(move |spawn| {
+            assert_eq!(spawn.len(), 1);
+            let path = PathBuf::from(spawn[0].split_prefix("@").unwrap());
+            let text = read_text(&mut File::open(&path).unwrap()).unwrap();
+            let decoded: Vec<OsString> = SplitMsvcResponseFileArgs::from(&text)
+                .map(OsString::from)
+                .collect();
+            assert_eq!(decoded, expected);
+            record.lock().unwrap().push(path);
+            Ok(MockChild::new(exit_status(0), "preprocessed", ""))
+        });
+        preprocess(
+            &creator,
+            &fixture.bins[0],
+            &args,
+            fixture.tempdir.path(),
+            &[],
+            false,
+            "",
+            false,
+            false,
+        )
+        .wait()
+        .unwrap();
+        let compiler = Msvc {
+            includes_prefix: String::new(),
+            is_clang: false,
+            version: None,
+        };
+        let (command, _, _) = compiler
+            .generate_compile_commands(
+                &mut dist::PathTransformer::new(),
+                &fixture.bins[0],
+                &args,
+                fixture.tempdir.path(),
+                &[],
+                false,
+            )
+            .unwrap();
+        let expected = command.get_arguments();
+        assert!(msvc_command_line_len(&fixture.bins[0], &expected) > 55_000);
+        let record = paths.clone();
+        creator.lock().unwrap().next_command_calls(move |spawn| {
+            assert_eq!(spawn.len(), 1);
+            let path = PathBuf::from(spawn[0].split_prefix("@").unwrap());
+            let text = read_text(&mut File::open(&path).unwrap()).unwrap();
+            let decoded: Vec<OsString> = SplitMsvcResponseFileArgs::from(&text)
+                .map(OsString::from)
+                .collect();
+            assert_eq!(decoded, expected);
+            record.lock().unwrap().push(path);
+            Ok(MockChild::new(exit_status(0), "", ""))
+        });
+        command.execute(&service, &creator).wait().unwrap();
+        assert_eq!(paths.lock().unwrap().len(), 2);
+        assert!(paths.lock().unwrap().iter().all(|path| !path.exists()));
+    }
+
+    #[test]
+    fn test_parse_arguments_existing_pdb_rejected_before_preprocessing() {
+        let fixture = TestFixture::new();
+        fixture.touch("shared.pdb").unwrap();
+        for pdb in ["shared.pdb", "shared"] {
+            assert_eq!(
+                CompilerArguments::CannotCache("shared pdb", None),
+                super::parse_arguments(
+                    &[
+                        OsString::from("/c"),
+                        OsString::from("foo.c"),
+                        OsString::from("/Zi"),
+                        OsString::from(format!("/Fd{pdb}")),
+                        OsString::from("/Fofoo.obj")
+                    ],
+                    fixture.tempdir.path(),
+                    false,
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn test_scan_warning_override_preserves_actual_compile_options() {
+        for pch_flags in [
+            ovec![],
+            ovec!["/Ycpch.h", "/Fppch.pch"],
+            ovec!["/Yupch.h", "/Fppch.pch"],
+        ] {
+            for warning_flags in [
+                ovec!["/WX"],
+                ovec!["-WX"],
+                ovec!["/WX-"],
+                ovec!["-WX-"],
+                ovec!["/WX", "-WX-", "-WX"],
+            ] {
+                let fixture = TestFixture::new();
+                let seed = fixture.touch("seed.pdb").unwrap();
+                fixture.touch("pch.pch").unwrap();
+                let mut arguments = ovec![
+                    "/c",
+                    "/Zi",
+                    "/Fdfoo.pdb",
+                    "/Fofoo.obj",
+                    "/W4",
+                    "/we4101",
+                    "foo.cpp"
+                ];
+                arguments.extend(pch_flags.clone());
+                arguments.extend(warning_flags.clone());
+                let args = match parse_arguments_with_pch_seed(
+                    &arguments,
+                    fixture.tempdir.path(),
+                    false,
+                    Some(&seed),
+                ) {
+                    CompilerArguments::Ok(args) => args,
+                    other => panic!("unexpected parse result: {other:?}"),
+                };
+                let scan = preprocessing_arguments(&args, false, false, false);
+                let warning_switches = |arguments: &[OsString]| {
+                    arguments
+                        .iter()
+                        .filter(|arg| matches!(arg.to_str(), Some("-WX" | "/WX" | "-WX-" | "/WX-")))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(warning_switches(&scan), ovec!["/WX-"]);
+                assert!(scan.contains(&OsString::from("/W4")));
+                assert!(scan.contains(&OsString::from("/we4101")));
+                let env = vec![("SCCACHE_MSVC_PCH_PDB".into(), seed.into_os_string())];
+                let (command, _, _) = generate_compile_commands(
+                    &mut dist::PathTransformer::new(),
+                    &fixture.bins[0],
+                    &args,
+                    fixture.tempdir.path(),
+                    &env,
+                )
+                .unwrap();
+                assert_eq!(warning_switches(&command.arguments), warning_flags);
+                assert!(command.arguments.contains(&OsString::from("/W4")));
+                assert!(command.arguments.contains(&OsString::from("/we4101")));
+            }
+        }
+    }
+
+    #[test]
+    fn test_preprocess_does_not_touch_compiler_pdb() {
+        let args = match parse_arguments(ovec!["/c", "foo.c", "/Zi", "/Fdunique.pdb", "/Fofoo.obj"])
+        {
+            CompilerArguments::Ok(args) => args,
+            other => panic!("unexpected parse result: {other:?}"),
+        };
+        let mut cmd = MockCommand {
+            child: None,
+            args: vec![],
+        };
+        preprocess_cmd(&mut cmd, &args, Path::new(""), &[], false, false, false);
+        assert_eq!(cmd.args, ovec!["-EP", "-nologo", "/Zi", "/WX-", "foo.c"]);
+        let fixture = TestFixture::new();
+        let (command, _, _) = generate_compile_commands(
+            &mut dist::PathTransformer::new(),
+            &fixture.bins[0],
+            &args,
+            fixture.tempdir.path(),
+            &[],
+        )
+        .unwrap();
+        assert!(command.arguments.contains(&OsString::from("/Fdunique.pdb")));
+        assert!(command.arguments.contains(&OsString::from("/Zi")));
     }
 
     #[test]

@@ -199,6 +199,9 @@ Note that some env variables may need sccache server restart to take effect.
 * `SCCACHE_IDLE_TIMEOUT` how long the local daemon process waits for more client requests before exiting, in seconds. Set to `0` to run sccache permanently
 * `SCCACHE_STARTUP_NOTIFY` specify a path to a socket which will be used for server completion notification
 * `SCCACHE_MAX_FRAME_LENGTH` how much data can be transferred between client and server
+* `SCCACHE_MSVC_PRIVATE_PDB` set to `1` for independently owned, object-derived MSVC `/Fd` outputs, including warm-existing ordinary and `/Yc` results. Shared PDBs remain unsupported; see the [MSVC ownership requirements](../README.md).
+* `SCCACHE_MSVC_PCH_PDB` immutable genuine creator-PDB snapshot used to seed private local `/Yu` outputs. The build must schedule both the matching PCH and snapshot before consumers.
+* `SCCACHE_MSVC_PCH_SOURCE_DEPENDENCIES` set to `1` to opt seeded `/Yu` actions into syntax-only dependency hashing with deterministic inputs. Hidden volatile PCH macro aliases are outside this contract; see the [MSVC validation guide](../tests/msvc-pdb-probe/README.md).
 * `SCCACHE_NO_DAEMON` set to `1` to disable putting the server to the background
 * `SCCACHE_CLIENT_SIDE` set to `1` to run the compile in the client process and use the daemon only as a gateway to the cache storage (see [the architecture doc](Architecture.md#client-side-mode-sccache_client_side)). This is the recommended mode and is expected to become the only supported configuration in the future. Ignored when `SCCACHE_LOG` or distributed compilation is in use.
 * `SCCACHE_CACHE_READ_TIMEOUT_SECS` how long, in seconds, a cache lookup may take before sccache gives up on it and compiles locally. Defaults to `60`. A lower value helps when the storage backend is slow or unresponsive rather than failing outright, for example in CI.
